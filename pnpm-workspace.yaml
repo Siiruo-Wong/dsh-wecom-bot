@@ -1,0 +1,4 @@
+# pnpm 11:构建脚本白名单(格式见 https://pnpm.io/settings)
+# esbuild 是 vitest/vite 的传递依赖,需要 postinstall 安装平台二进制
+allowBuilds:
+  esbuild: true
