@@ -15,6 +15,7 @@
 ## 特性
 
 - **进程内插件**：复用 dsh 的 agent 核心与 JSONL 会话持久化，不额外开子进程，随 profile 一起加载/卸载；
+- **界面配置**：安装后可在 dsh「设置 → 插件 → 插件配置」里可视化配置 botId/botSecret、从 dsh 已配置的模型中选择 provider/model、设置 AI 会话工作路径，保存即热生效（无需改 YAML）；
 - **双通道**：`mode` 可选 `longconn`（长连接，默认）/ `callback`（回调）/ `both`，同一 agent 会话双通道互通；
 - **多轮对话**：同一会话复用同一 agent（sessionId），上下文自然延续；
 - **流式占位**（长连接）：任务开始时先回「思考中」占位，最终答案再刷新，用户不再干等；
@@ -75,6 +76,21 @@ dsh plugin --profile web add /path/to/dsh-wecom-bot
 > 尚未完整发布到 npm），因此声明为**可选 peer 依赖**——`npm install` / `dsh plugin add` 都不会尝试
 > 从 npm 拉取它们；若插件报找不到模块，说明宿主版本缺少这两个包。
 
+## 界面配置（推荐）
+
+插件安装并启用后，打开 dsh 的 **设置 → 插件 → 插件配置**，找到 **企业微信机器人** 卡片即可可视化配置：
+
+| 字段 | 说明 |
+|---|---|
+| `botId` / `botSecret` | 智能机器人凭据（长连接模式必填），保存后立即重连 |
+| `provider` / `model` | 从 dsh 已配置的模型列表中选择，作用于该机器人会话 |
+| `workspace` | AI 会话工作目录（bash/文件系统工具活动根），相对路径按 dsh 工作区解析 |
+| `maxTokens` | 单次请求输出 token 上限（0 = 跟随宿主默认） |
+| `taskPrefix` | 拼在每条消息前的人设/安全约束 |
+
+- 改动**保存即生效**（`applies: live`）：模型/工作目录/任务前缀等下一次会话即用新值；botId/botSecret 变更会立即重建长连接。
+- 未改写的字段继承 `cordis.patch.yml` 里的装配配置（UI 层覆盖装配层，装配层覆盖默认值）。
+- 界面配置仅覆盖 UI 暴露的字段；`mode`、心跳、超时等高级项仍走 `cordis.patch.yml` 或环境变量。
 ## 配置
 
 | 配置键 | 环境变量 | 默认值 | 说明 |

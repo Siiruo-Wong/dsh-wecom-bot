@@ -111,3 +111,18 @@ export interface LoggerLike {
   error(message: string, ...args: unknown[]): void
   debug(message: string, ...args: unknown[]): void
 }
+/** dsh 设置服务的最小接口面(与 @deepseek-ai/dsh-settings 的 Service 形状对齐)。 */
+export interface SettingsServiceLike {
+  register<T>(namespace: string, schema: unknown, options?: {
+    base?: Partial<T>
+    applies?: 'live' | 'restart'
+  }): SettingsScopeLike<T>
+}
+
+/** 一个注册命名空间的 owner 句柄。 */
+export interface SettingsScopeLike<T> {
+  /** 当前解析值:schema 默认 → base → 用户层。 */
+  get(): T
+  /** 观察该命名空间的提交变更,返回取消函数。 */
+  watch(callback: (next: T, prev: T) => void | Promise<void>): () => void
+}

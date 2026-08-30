@@ -10,25 +10,31 @@
       "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./client": {
+      "default": "./lib/client.js"
+    }
   },
   "files": [
     "lib/**/*",
     "README.md",
     "LICENSE",
     "SECURITY.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "lib/client.js",
+    "src/client"
   ],
   "engines": {
     "node": ">=22.19.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/build-client.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "oxlint src test",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "build:client": "node scripts/build-client.mjs"
   },
   "keywords": [
     "deepseek-harness",
@@ -57,7 +63,10 @@
   "devDependencies": {
     "@deepseek-ai/schemastery": "^3.18.1",
     "@types/node": "^22.10.0",
+    "@types/react": "^19.2.18",
+    "esbuild": "^0.28.2",
     "oxlint": "^0.15.0",
+    "react": "^19.2.8",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   },
@@ -71,5 +80,16 @@
   },
   "dependencies": {
     "@wecom/aibot-node-sdk": "^1.0.7"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
   }
 }

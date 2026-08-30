@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { AgentBridge, type AgentBridgeConfig } from '../src/agent-bridge.js'
+import { AgentBridge, lastAssistantText, type AgentBridgeConfig } from '../src/agent-bridge.js'
 import type { AgentHandleLike, AgentsServiceLike, ReplyTarget, UserMessageLike } from '../src/types.js'
 import type { ReplySender } from '../src/types.js'
 
@@ -226,3 +226,92 @@ describe('AgentBridge', () => {
     expect(h.sends).toHaveLength(0)
   })
 })
+describe('lastAssistantText error surfacing', () => {
+  it('returns the turn error message alongside the error kind', () => {
+    const events = [
+      { type: 'turn/start', data: { turn: 1 } },
+      {
+        type: 'turn/end',
+        data: {
+          reason: {
+            kind: 'error',
+            error: { message: 'prompt variable "{{model}}" has no value (section "deployment:persona")' },
+          },
+        },
+      },
+    ]
+    const { text, reason, errorMessage } = lastAssistantText(events as never)
+    expect(text).toBe('')
+    expect(reason).toBe('error')
+    expect(errorMessage).toContain('{{model}}')
+  })
+
+  it('keeps errorMessage undefined when the error carries no message', () => {
+    const events = [{ type: 'turn/end', data: { reason: { kind: 'error' } } }]
+    const { reason, errorMessage } = lastAssistantText(events as never)
+    expect(reason).toBe('error')
+    expect(errorMessage).toBeUndefined()
+  })
+})
+
+  it('会话创建冲突:自动换新 sessionId 重试一次并正常回复', async () => {
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
+    const created: { sessionId: string }[] = []
+    const follows: UserMessageLike[] = []
+    const sends: { target: ReplyTarget; content: string }[] = []
+    let liveAgent: AgentHandleLike | null = null
+    let attempts = 0
+
+    const agents: AgentsServiceLike = {
+      async create(options) {
+        attempts++
+        if (attempts === 1) {
+          throw new Error('session "wecom:user1" already has a persisted log on disk that does not match this live session (id collision)')
+        }
+        created.push({ sessionId: options.sessionId })
+        const agent = { id: options.sessionId, session: { id: options.sessionId }, followup(m: UserMessageLike) { follows.push(m) } }
+        liveAgent = { agent, dispose: async () => { liveAgent = null } }
+        return liveAgent
+      },
+      get(id) {
+        return liveAgent && liveAgent.agent.id === id ? liveAgent.agent : undefined
+      },
+    }
+
+    const ctx = {
+      agents,
+      on(event: string, handler: (...args: unknown[]) => void) {
+        const list = listeners.get(event) ?? []
+        list.push(handler)
+        listeners.set(event, list)
+        return () => {
+          const arr = listeners.get(event) ?? []
+          const at = arr.indexOf(handler)
+          if (at >= 0) arr.splice(at, 1)
+        }
+      },
+    }
+    const wecom = { sendText: vi.fn(async (target: ReplyTarget, content: string) => { sends.push({ target, content }) }) } as unknown as ReplySender
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }
+    const bridge = new AgentBridge(ctx as never, makeConfig({}), wecom, logger)
+
+    bridge.enqueue('user1', '你好', { touser: 'u1' })
+    await tick()
+    // 首次 create 失败重试:第二次用新 sessionId 成功
+    expect(created).toHaveLength(1)
+    expect(created[0]?.sessionId).not.toBe('wecom:user1')
+    expect(created[0]?.sessionId).toMatch(/^wecom:user1#/)
+    expect(follows[0]?.content[0]?.text).toBe('你好')
+
+    // 后续事件按新 sessionId 流转,回复正常
+    for (const handler of listeners.get('session/event') ?? []) {
+      handler({ id: created[0]?.sessionId }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '冲突后仍工作' }] } } })
+    }
+    for (const handler of listeners.get('agent/status') ?? []) {
+      handler({ agent: { session: { id: created[0]?.sessionId } }, status: 'idle' })
+    }
+    await tick()
+    expect(sends).toHaveLength(1)
+    expect(sends[0]?.content).toBe('冲突后仍工作')
+    await bridge.dispose()
+  })

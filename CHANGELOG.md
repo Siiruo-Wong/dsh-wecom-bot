@@ -1,5 +1,26 @@
 # 更新日志
 
+## 0.3.0 (未发布)
+
+### 新增
+
+- **界面配置**:安装后在 dsh「设置 → 插件 → 插件配置」出现「企业微信机器人」卡片,可可视化配置
+  botId/botSecret、从 dsh 已配置的模型中选择 provider/model、设置 AI 会话工作路径、maxTokens 与 taskPrefix;
+  保存即热生效(applies: live),botId/botSecret 变更立即重建长连接。
+- 浏览器半侧 bundle(lib/client.js):经 dsh 的 client-modules 以 __ModuleLoader__ closure-factory 加载,
+  自包含卡片实现(内联样式,无 CSS 依赖),模型下拉列表来自 dsh 模型目录 api.llm.models。
+
+### 变更
+
+- 设置命名空间 wecom-bot:装配配置作为 base,UI 用户层覆盖;settings 服务缺失的 profile 静默降级到装配配置。
+- AgentBridge 上报轮次错误详情:回复末尾附错误信息(不再只显示笼统失败)。
+- 会话冲突重建:创建 agent 会话失败时按冲突提示重试(避免持久化会话与内存状态错位)。
+- 移除调试期 console.log,lib 由干净构建重新生成。
+
+### 修复
+
+- 设置热更新对相对 workspace 按 dsh 工作区解析后再应用。
+
 ## 0.2.0 (未发布)
 
 ### 新增

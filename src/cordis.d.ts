@@ -21,6 +21,8 @@ declare module '@deepseek-ai/cordis' {
     on(event: string, handler: (...args: unknown[]) => void): () => void
     /** 注册一个随卸载执行的清理 effect */
     effect(fn: () => unknown, name?: string): void
+    /** 声明服务依赖,宿主在 setup 阶段按序注入(settings 等) */
+    inject<T extends readonly string[]>(services: T, callback: (ctx: unknown) => void): void
     plugin<T>(plugin: T, config?: unknown): Promise<void>
     get<T>(key: string): T | undefined
     [key: string]: unknown

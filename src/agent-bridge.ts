@@ -56,13 +56,18 @@ export function buildUserMessage(task: string): UserMessageLike {
   }
 }
 
-/** 从事件流提取最后一条 assistant 文本与最后的 turn 结束原因 */
-export function lastAssistantText(events: SessionEventLike[]): { text: string; reason: string | undefined } {
+/** 从事件流提取最后一条 assistant 文本、turn 结束原因与错误消息 */
+export function lastAssistantText(events: SessionEventLike[]): { text: string; reason: string | undefined; errorMessage: string | undefined } {
   let text = ''
   let reason: string | undefined
+  let errorMessage: string | undefined
   for (const event of events) {
     if (event.type === 'turn/end') {
       reason = event.data?.reason?.kind
+      const reasonData = event.data?.reason as { error?: { message?: unknown } } | undefined
+      if (reasonData?.error && typeof reasonData.error.message === 'string') {
+        errorMessage = reasonData.error.message
+      }
       continue
     }
     if (event.type !== 'assistant/message') continue
@@ -84,7 +89,7 @@ export function lastAssistantText(events: SessionEventLike[]): { text: string; r
     }
     if (parts.length > 0) text = parts.join('')
   }
-  return { text, reason }
+  return { text, reason, errorMessage }
 }
 
 /** 按 UTF-8 字节数截断,保持字符边界完整(不截断多字节字符/emoji) */
@@ -108,6 +113,8 @@ function errMessage(error: unknown): string {
 
 export class AgentBridge {
   private readonly sessions = new Map<string, SessionState>()
+  /** agent 实际会话 id -> 状态键(冲突重试后 agent id 可能与状态键不同) */
+  private readonly agentToSession = new Map<string, string>()
   private readonly disposers: (() => void)[] = []
 
   constructor(
@@ -130,6 +137,14 @@ export class AgentBridge {
         this.onAgentStatus(agent.session.id, status)
       }
     }))
+  }
+
+  /**
+   * 热更新桥接配置(由设置命名空间变更触发)。只影响之后新建的 agent;
+   * 已在运行的会话保持其既有 agent,直到超时/失效后重建。
+   */
+  update(patch: Partial<AgentBridgeConfig>): void {
+    Object.assign(this.cfg, patch)
   }
 
   /** 会话键 -> 全局唯一的 dsh sessionId(避免与 Web UI 会话冲突) */
@@ -180,39 +195,64 @@ export class AgentBridge {
 
   private async ensureHandle(sessionId: string, state: SessionState): Promise<AgentHandleLike> {
     if (state.handle) {
-      // 插件重载/外部处置后注册表里可能已无此 agent:校验存活,失效则重建
-      if (this.ctx.agents.get(sessionId) === state.handle.agent) return state.handle
+      // 插件重载/外部处置后注册表里可能已无此 agent:校验存活(按 agent 实际 id,冲突重试后可能与状态键不同),失效则重建
+      if (this.ctx.agents.get(state.handle.agent.id) === state.handle.agent) return state.handle
+      this.agentToSession.delete(state.handle.agent.id)
       state.handle = null
     }
     if (state.creating) return state.creating
-    const creating = this.ctx.agents.create({
-      sessionId,
-      meta: { cwd: this.cfg.workspace },
-      agentOptions: {
-        ...(this.cfg.provider ? { provider: this.cfg.provider } : {}),
-        ...(this.cfg.model ? { model: this.cfg.model } : {}),
-        ...(this.cfg.maxTokens ? { maxTokens: this.cfg.maxTokens } : {}),
-      },
-    })
+    const creating = this.createAgentHandle(sessionId)
     state.creating = creating
     try {
       const handle = await creating
       state.handle = handle
+      this.agentToSession.set(handle.agent.id, sessionId)
       return handle
     } finally {
       state.creating = null
     }
   }
 
+  /** 会话创建冲突(磁盘持久化会话与内存状态错位)时自动换新 sessionId 重试一次。 */
+  private async createAgentHandle(sessionId: string): Promise<AgentHandleLike> {
+    try {
+      return await this.ctx.agents.create({
+        sessionId,
+        meta: { cwd: this.cfg.workspace },
+        agentOptions: {
+          ...(this.cfg.provider ? { provider: this.cfg.provider } : {}),
+          ...(this.cfg.model ? { model: this.cfg.model } : {}),
+          ...(this.cfg.maxTokens ? { maxTokens: this.cfg.maxTokens } : {}),
+        },
+      })
+    } catch (error) {
+      const message = String((error as { message?: unknown })?.message ?? error)
+      if (/collision|persisted log|does not match this live session/i.test(message)) {
+        const alt = sessionId + '#' + Date.now().toString(36)
+        this.logger.warn(`[wecom-bot] 会话 ${sessionId} 创建冲突(${message.slice(0, 80)}),改用 ${alt} 重试`)
+        return this.ctx.agents.create({
+          sessionId: alt,
+          meta: { cwd: this.cfg.workspace },
+          agentOptions: {
+            ...(this.cfg.provider ? { provider: this.cfg.provider } : {}),
+            ...(this.cfg.model ? { model: this.cfg.model } : {}),
+            ...(this.cfg.maxTokens ? { maxTokens: this.cfg.maxTokens } : {}),
+          },
+        })
+      }
+      throw error
+    }
+  }
+
   private onSessionEvent(sessionId: string, event: SessionEventLike): void {
-    const state = this.sessions.get(sessionId)
+    const state = this.sessions.get(this.agentToSession.get(sessionId) ?? sessionId)
     if (!state || !state.busy) return
     state.events.push(event)
     if (state.events.length > 1000) state.events.splice(0, state.events.length - 1000)
   }
 
   private onAgentStatus(sessionId: string, status: string): void {
-    const state = this.sessions.get(sessionId)
+    const state = this.sessions.get(this.agentToSession.get(sessionId) ?? sessionId)
     if (!state || !state.busy || status !== 'idle') return
     void this.finishTurn(sessionId, state)
   }
@@ -229,9 +269,9 @@ export class AgentBridge {
       void this.pump(sessionId)
       return
     }
-    const { text, reason } = lastAssistantText(state.events)
+    const { text, reason, errorMessage } = lastAssistantText(state.events)
     const note = reason === 'error'
-      ? '\n\n(⚠️ 本次任务出现错误)'
+      ? '\n\n(⚠️ 本次任务出现错误' + (errorMessage ? ': ' + errorMessage : '') + ')'
       : reason === 'max-tokens'
         ? '\n\n(⚠️ 已达输出上限,回复可能不完整)'
         : ''
@@ -263,6 +303,7 @@ export class AgentBridge {
   /** 插件卸载时清理:取消监听、清定时器、处置所有会话句柄 */
   async dispose(): Promise<void> {
     for (const dispose of this.disposers.splice(0)) dispose()
+    this.agentToSession.clear()
     const states = [...this.sessions.values()]
     this.sessions.clear()
     for (const state of states) {

@@ -13,15 +13,17 @@
  * 安全:凭据不入日志、长度限制、队列深度限制、默认仅绑定 127.0.0.1。
  * 详见 README.md 与 SECURITY.md。
  */
+import { resolve } from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { ConfigError, resolveConfig, type Config } from './config.js'
+import { WECOM_SETTINGS_NAMESPACE, WecomSettingsSchema, type WecomSettings } from './settings.js'
 import { decryptWecomMessage, verifySignature } from './crypto.js'
 import { WecomApi } from './wecom-api.js'
 import { CallbackServer } from './http-server.js'
 import { AgentBridge } from './agent-bridge.js'
 import { WecomLongConn } from './wecom-longconn.js'
-import type { AgentsServiceLike, ParsedCallback, ReplySender, ReplyTarget } from './types.js'
+import type { AgentsServiceLike, ParsedCallback, ReplySender, ReplyTarget, SettingsServiceLike, SettingsScopeLike } from './types.js'
 
 export type { Config } from './config.js'
 export { ConfigError } from './config.js'
@@ -34,6 +36,8 @@ type BridgeCtx = {
 }
 
 export class WecomBot extends Service {
+  static inject = ['agents']
+
   static Config: z<Config> = z.object({
     mode: z.union([z.const('callback'), z.const('longconn'), z.const('both')]).default('longconn'),
     host: z.union([z.const('127.0.0.1'), z.const('0.0.0.0')]).default('127.0.0.1'),
@@ -70,11 +74,13 @@ export class WecomBot extends Service {
     apiTimeoutMs: z.natural().default(15_000),
   })
 
-  private readonly cfg: Config
+  private cfg: Config
   private readonly bridge: AgentBridge
   private readonly wecom?: WecomApi
-  private readonly longconn?: WecomLongConn
+  private longconn?: WecomLongConn
   private readonly server?: CallbackServer
+  private settingsScope?: SettingsScopeLike<WecomSettings>
+  private settingsDispose?: () => void
 
   constructor(ctx: Context, raw: Partial<Config> = {}) {
     super(ctx, 'wecomBot')
@@ -126,6 +132,12 @@ export class WecomBot extends Service {
     if (needLongConn) {
       this.longconn = new WecomLongConn(cfg, { bridge: this.bridge, logger: ctx.logger })
     }
+
+    // 用户设置命名空间:base = 装配配置,用户层 = UI 写入;变更时热更新。
+    // settings 服务在无设置提供方的 profile 中不存在,inject 不触发即静默降级。
+    ctx.inject(['settings'], (settingsCtx) => {
+      this.attachSettings(settingsCtx as { settings: SettingsServiceLike })
+    })
   }
 
   async [Service.init](): Promise<void> {
@@ -153,6 +165,78 @@ export class WecomBot extends Service {
       if (this.longconn) await this.longconn.dispose()
       await this.bridge.dispose()
     }, 'wecom-bot.lifecycle')
+  }
+
+  /**
+   * 注册 wecom-bot 设置命名空间并应用初始值,随后监听变更热更新。
+   * @param ctx - 注入了 settings 服务的上下文。
+   */
+  private attachSettings(settingsCtx: { settings: SettingsServiceLike }): void {
+    try {
+      const scope = settingsCtx.settings.register<WecomSettings>(
+        WECOM_SETTINGS_NAMESPACE,
+        WecomSettingsSchema,
+        {
+          // 装配配置作为 base:UI 未改写时继承现有值;applies=live 表示保存即生效。
+          base: {
+            botId: this.cfg.botId,
+            botSecret: this.cfg.botSecret,
+            provider: this.cfg.provider,
+            model: this.cfg.model,
+            workspace: this.cfg.workspace,
+            maxTokens: this.cfg.maxTokens,
+            taskPrefix: this.cfg.taskPrefix,
+          },
+          applies: 'live',
+        },
+      )
+      this.settingsScope = scope
+      this.applySettings(scope.get())
+      this.settingsDispose = scope.watch((next) => { this.applySettings(next) })
+    } catch (error) {
+      this.ctx.logger.warn('[wecom-bot] 设置命名空间注册失败,回退到装配配置', error)
+    }
+  }
+
+  /**
+   * 把设置命名空间的解析值合并进运行配置,并按需热更新组件。
+   * 空字符串表示"未配置/继承默认",不覆盖现有值。
+   */
+  private applySettings(s: WecomSettings): void {
+    const old = this.cfg
+    const next: Config = { ...old }
+    const applyString = (key: 'botId' | 'botSecret' | 'provider' | 'model' | 'workspace' | 'taskPrefix', value: string): void => {
+      if (value === '') return
+      next[key] = value
+    }
+    applyString('botId', s.botId)
+    applyString('botSecret', s.botSecret)
+    applyString('provider', s.provider)
+    applyString('model', s.model)
+    applyString('taskPrefix', s.taskPrefix)
+    if (s.workspace !== '') {
+      next.workspace = s.workspace.startsWith('/') ? s.workspace : resolve(s.workspace)
+    }
+    if (s.maxTokens > 0) next.maxTokens = s.maxTokens
+
+    const connectionChanged = next.botId !== old.botId || next.botSecret !== old.botSecret
+    this.cfg = next
+    this.bridge.update({
+      workspace: next.workspace,
+      provider: next.provider,
+      model: next.model,
+      maxTokens: next.maxTokens,
+    })
+
+    // 凭据变化:重建长连接(幂等:未启动的连接 dispose 是安全的)
+    if (connectionChanged && this.longconn) {
+      const logger = this.ctx.logger
+      const oldConn = this.longconn
+      this.longconn = new WecomLongConn(next, { bridge: this.bridge, logger })
+      void oldConn.dispose().then(() => {
+        logger.info('[wecom-bot] 已按新 botId/botSecret 重建长连接')
+      })
+    }
   }
 
   private decryptPayload(encrypt: string, params: URLSearchParams): string {
