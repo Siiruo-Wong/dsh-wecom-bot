@@ -68,5 +68,8 @@
     "@deepseek-ai/schemastery": {
       "optional": true
     }
+  },
+  "dependencies": {
+    "@wecom/aibot-node-sdk": "^1.0.7"
   }
 }

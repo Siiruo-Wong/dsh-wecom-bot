@@ -8,19 +8,28 @@
 在企业微信里私聊机器人、或在群里 @ 它，就能驱动 **dsh agent**（思考 + 工具调用 + 文件/命令操作），
 完成后把结果推回企业微信。
 
+支持两种接收通道，可切换或同时启用：
+- **长连接模式（默认）**：智能机器人 WebSocket 长连接（`wss://openws.work.weixin.qq.com`），无需公网地址，本机直连即可，回复走同一条连接（支持「思考中」流式占位）；
+- **回调模式**：自建应用 HTTPS 回调（验签解密 + URL 验证），适合已有公网域名的场景。
+
 ## 特性
 
 - **进程内插件**：复用 dsh 的 agent 核心与 JSONL 会话持久化，不额外开子进程，随 profile 一起加载/卸载；
+- **双通道**：`mode` 可选 `longconn`（长连接，默认）/ `callback`（回调）/ `both`，同一 agent 会话双通道互通；
 - **多轮对话**：同一会话复用同一 agent（sessionId），上下文自然延续；
-- **先回 200 再异步**：满足企微回调 5 秒超时约束，长任务完成后主动推送；
+- **流式占位**（长连接）：任务开始时先回「思考中」占位，最终答案再刷新，用户不再干等；
+- **先回 200 再异步**（回调）：满足企微回调 5 秒超时约束，长任务完成后主动推送；
 - **安全默认**：签名常数时间比较、AES 严格校验、请求体/文本/队列长度上限、凭据不入日志、默认只绑定本机；
-- **健壮**：每会话 FIFO 队列、单轮超时保护、agent 失效自愈重建、企微 token 单飞缓存 + 失效自动刷新、优雅停服。
+- **健壮**：每会话 FIFO 队列、单轮超时保护、agent 失效自愈重建、长连接心跳保活 + 指数退避重连、优雅停服。
 
 ## 架构
 
 ```
- 企业微信用户 --私聊/群@--> 企微回调(HTTPS) --> [dsh-wecom-bot 插件] --ctx.agents.create/followup--> dsh agent
-                <--应用消息 API 主动推送--  [验签解密 -> FIFO队列 -> 多轮会话] <--session/event 取最终答复--
+长连接模式(默认):  企业微信 --wss 长连接--> [SDK WSClient 认证/心跳/重连] --aibot_msg_callback--> 适配器 --enqueue--> [AgentBridge 队列/多轮]
+                              <--aibot_respond_msg 流式回复--    [思考占位 + 最终答案] <--session/event 取最终答复--
+
+回调模式:          企业微信 --HTTPS 回调--> [CallbackServer 验签解密] --handleMessage--> 同上 AgentBridge
+                              <--应用消息 API 主动推送--  [touser/chatid 回复]
 ```
 
 ## 安装
@@ -28,8 +37,8 @@
 ### 前置条件
 
 - dsh（DeepSeek Harness）Node.js ≥ 22.19；
-- 一个企业微信自建应用（管理后台创建，拿到 CorpID / AgentId / Secret）；
-- 一个公网可达的 HTTPS 地址（云服务器，或本机 + cloudflared / ngrok / frp 内网穿透）。
+- 长连接模式：一个企业微信**智能机器人**（后台拿到 botId / botSecret），无需公网；
+- 回调模式：一个企业微信自建应用（CorpID / AgentId / Secret）+ 公网可达 HTTPS 地址（云服务器，或本机 + 内网穿透）。
 
 ### 安装到 dsh profile
 
@@ -51,14 +60,14 @@ dsh plugin --profile web add /path/to/dsh-wecom-bot
 - id: wecom-bot
   name: dsh-wecom-bot
   config:
-    corpId: !!js process.env.WECOM_BOT_CORP_ID
-    appSecret: !!js process.env.WECOM_BOT_APP_SECRET
-    agentId: !!js Number(process.env.WECOM_BOT_AGENT_ID)
-    token: !!js process.env.WECOM_BOT_TOKEN
-    aesKey: !!js process.env.WECOM_BOT_AES_KEY
+    mode: longconn                # longconn(默认) / callback / both
+    botId: !!js process.env.WECOM_BOT_BOT_ID
+    botSecret: !!js process.env.WECOM_BOT_BOT_SECRET
     workspace: !!js process.env.WECOM_BOT_WORKSPACE ?? process.cwd()
     taskPrefix: 你是在企业微信里为用户提供帮助的智能助手，请用中文简洁作答。
 ```
+
+回调模式把 `mode` 换成 `callback`，并配置 `corpId` / `appSecret` / `agentId` / `token` / `aesKey`（见下方配置表）。
 
 > 也可以只配置 `.env` 环境变量（`WECOM_BOT_*`，见 [.env.example](.env.example)），插件会自动读取。
 >
@@ -70,7 +79,18 @@ dsh plugin --profile web add /path/to/dsh-wecom-bot
 
 | 配置键 | 环境变量 | 默认值 | 说明 |
 |---|---|---|---|
-| `host` | `WECOM_BOT_HOST` | `127.0.0.1` | 回调监听地址；公网暴露必须走 HTTPS 反代/隧道 |
+| `mode` | `WECOM_BOT_MODE` | `longconn` | 接收通道：`longconn` / `callback` / `both` |
+| `botId` | `WECOM_BOT_BOT_ID` | — | 智能机器人 ID（企业微信后台获取，longconn 必填） |
+| `botSecret` | `WECOM_BOT_BOT_SECRET` | — | 智能机器人 Secret（企业微信后台获取，longconn 必填） |
+| `scene` | `WECOM_BOT_SCENE` | — | 长连接认证场景值（可选） |
+| `wsUrl` | `WECOM_BOT_WS_URL` | `wss://openws.work.weixin.qq.com` | 长连接地址（私有化部署需改） |
+| `heartbeatIntervalMs` | `WECOM_BOT_HEARTBEAT_INTERVAL_MS` | `30000` | 长连接心跳间隔 |
+| `reconnectBaseDelayMs` | `WECOM_BOT_RECONNECT_BASE_DELAY_MS` | `1000` | 重连基础延迟（指数退避 1s→30s） |
+| `maxReconnectAttempts` | `WECOM_BOT_MAX_RECONNECT_ATTEMPTS` | `10` | 断连最大重连次数，`-1` 无限 |
+| `maxAuthFailureAttempts` | `WECOM_BOT_MAX_AUTH_FAILURE_ATTEMPTS` | `5` | 认证失败最大重试，`-1` 无限 |
+| `requestTimeoutMs` | `WECOM_BOT_REQUEST_TIMEOUT_MS` | `10000` | 长连接请求超时 |
+| `thinkingHint` | `WECOM_BOT_THINKING_HINT` | `🤔 正在思考,请稍候…` | 思考占位文案（空串禁用） |
+| `host` | `WECOM_BOT_HOST` | `127.0.0.1` | 回调监听地址；公网暴露必须走 HTTPS 反代/隧道（callback） |
 | `port` | `WECOM_BOT_PORT` | `8787` | 回调监听端口 |
 | `path` | `WECOM_BOT_PATH` | `/wecom/callback` | 回调路径 |
 | `corpId` | `WECOM_BOT_CORP_ID` | — | 企业微信 CorpID（必填） |
@@ -94,6 +114,14 @@ dsh plugin --profile web add /path/to/dsh-wecom-bot
 | `apiTimeoutMs` | `WECOM_BOT_API_TIMEOUT_MS` | `15000` | 企微 API 请求超时 |
 
 ## 企业微信后台配置（一次性）
+
+### 长连接模式（默认，推荐）
+
+1. 企业微信管理后台 → **智能机器人** → 创建/进入你的机器人；
+2. 记录 **机器人 ID（botId）** 与 **机器人 Secret（botSecret）**，填入插件配置或 `WECOM_BOT_BOT_ID` / `WECOM_BOT_BOT_SECRET` 环境变量；
+3. 无需配置回调 URL、无需公网域名、无需内网穿透——插件启动后自动建立 WebSocket 长连接。
+
+### 回调模式
 
 1. 管理后台 → 应用管理 → 自建 → 创建应用，记录 CorpID / AgentId / Secret；
 2. 应用 → 接收消息 → 设置 API 接收：
@@ -121,7 +149,6 @@ CI（GitHub Actions）会在 push/PR 时自动执行 typecheck + test + lint + b
 - `npm warn EBADENGINE`：本插件运行在 dsh 宿主内，engines 与宿主一致要求 node `>=22.19.0`，
   本地开发用稍旧版本只会报警告，不影响 typecheck/test/build；
 - `ERR_PNPM_IGNORED_BUILDS: esbuild`：pnpm 10+ 默认禁止依赖执行 build 脚本；已在 `pnpm-workspace.yaml` 的 `allowBuilds` 白名单放行，重新 `pnpm install` 即可。
-  本地开发用稍旧版本只会报警告，不影响 typecheck/test/build。
 
 ## 安全
 
@@ -141,7 +168,7 @@ pnpm test && pnpm lint && pnpm build
 pnpm publish --access public   # 发布到 npm
 ```
 
-发布前请把 `package.json` 里 `repository` / `bugs` / `homepage` 的占位地址改为你的仓库。
+发布前请确认 `package.json` 里 `repository` / `bugs` / `homepage` 指向你的仓库。
 
 ## 许可
 

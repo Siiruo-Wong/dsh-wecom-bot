@@ -63,10 +63,45 @@ export interface ParsedCallback {
   createTime: string | undefined
 }
 
-/** 回复目标:私聊 touser / 群聊 chatid 二选一 */
+/** 回复目标:回调模式私聊 touser / 群聊 chatid;长连接模式 reqId + streamId */
 export interface ReplyTarget {
   touser?: string
   chatid?: string
+  /** 长连接:企微 aibot_msg_callback 帧的 req_id,回复时原样回显 */
+  reqId?: string
+  /** 长连接:流式消息 ID,思考占位与最终回复共用 */
+  streamId?: string
+}
+
+/** 长连接 WS 客户端最小接口面(由 @wecom/aibot-node-sdk 的 WSClient 实现;测试注入桩) */
+export interface LongConnClientLike {
+  connect(): unknown
+  disconnect(): void
+  removeListener?(event: string, handler: (...args: any[]) => void): void
+  replyStream(
+    frame: { headers: { req_id: string } },
+    streamId: string,
+    content: string,
+    finish?: boolean,
+  ): Promise<unknown>
+  on(event: string, handler: (...args: any[]) => void): unknown
+}
+
+/** 长连接收到的文本消息帧(与 SDK WsFrame<TextMessage> 结构对齐) */
+export interface LongConnFrameLike {
+  headers: { req_id: string }
+  body?: {
+    msgid?: string
+    chatid?: string
+    chattype?: string
+    from?: { userid?: string }
+    text?: { content?: string }
+  }
+}
+
+/** 回复发送器:AgentBridge 只依赖这个接口(回调模式走企微 API,长连接模式走 WS) */
+export interface ReplySender {
+  sendText(target: ReplyTarget, content: string): Promise<void>
 }
 
 /** 轻量 logger 接口(与 cordis Logger 的方法名一致) */

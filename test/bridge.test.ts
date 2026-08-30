@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AgentBridge, type AgentBridgeConfig } from '../src/agent-bridge.js'
 import type { AgentHandleLike, AgentsServiceLike, ReplyTarget, UserMessageLike } from '../src/types.js'
-import type { WecomApi } from '../src/wecom-api.js'
+import type { ReplySender } from '../src/types.js'
 
 interface Harness {
   bridge: AgentBridge
@@ -74,7 +74,7 @@ function makeHarness(overrides: Partial<AgentBridgeConfig> = {}): Harness {
     sendText: vi.fn(async (target: ReplyTarget, content: string) => {
       sends.push({ target, content })
     }),
-  } as unknown as WecomApi
+  } as unknown as ReplySender
 
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }
   const bridge = new AgentBridge(ctx, makeConfig(overrides), wecom, logger)
@@ -195,7 +195,7 @@ describe('AgentBridge', () => {
     }
     const wecom = {
       sendText: vi.fn(async (target: ReplyTarget, content: string) => { sends.push({ target, content }) }),
-    } as unknown as WecomApi
+    } as unknown as ReplySender
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }
     const bridge = new AgentBridge(ctx, makeConfig(), wecom, logger)
     bridge.enqueue('user1', 'x', { touser: 'u1' })

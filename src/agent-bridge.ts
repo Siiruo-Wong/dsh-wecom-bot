@@ -17,7 +17,7 @@ import type {
   SessionEventLike,
   UserMessageLike,
 } from './types.js'
-import type { WecomApi } from './wecom-api.js'
+import type { ReplySender } from './types.js'
 
 export interface AgentBridgeConfig {
   workspace: string
@@ -116,7 +116,7 @@ export class AgentBridge {
       on(event: string, handler: (...args: unknown[]) => void): () => void
     },
     private readonly cfg: AgentBridgeConfig,
-    private readonly wecom: WecomApi,
+    private readonly sender: ReplySender,
     private readonly logger: LoggerLike,
   ) {
     this.disposers.push(ctx.on('session/event', (session, event) => {
@@ -254,7 +254,7 @@ export class AgentBridge {
   }
 
   private reply(target: ReplyTarget, content: string): Promise<void> {
-    return this.wecom.sendText(target, truncateUtf8(content, this.cfg.replyLimitBytes))
+    return this.sender.sendText(target, truncateUtf8(content, this.cfg.replyLimitBytes))
       .catch((error: unknown) => {
         this.logger.error('[wecom-bot] 回复发送失败', error)
       })
