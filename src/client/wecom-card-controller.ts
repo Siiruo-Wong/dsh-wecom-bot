@@ -75,7 +75,8 @@ function parseValue(field: WecomField, text: string): { kind: 'set'; value: unkn
     const trimmed = text.trim()
     if (trimmed === '') return { kind: 'clear' }
     const n = Number(trimmed)
-    return Number.isFinite(n) && n > 0 ? { kind: 'set', value: n } : undefined
+    // z.natural():非负整数;0 表示"跟随宿主默认"(保存后宿主 maxTokens>0 才应用)
+    return Number.isInteger(n) && n >= 0 ? { kind: 'set', value: n } : undefined
   }
   const trimmed = text.trim()
   return trimmed === '' ? { kind: 'clear' } : { kind: 'set', value: trimmed }
