@@ -17,6 +17,7 @@ import type {
   LoggerLike,
   ReplyTarget,
   SessionEventLike,
+  SessionTitleServiceLike,
   UserMessageLike,
 } from './types.js'
 import type { ReplySender } from './types.js'
@@ -316,7 +317,9 @@ export class AgentBridge {
    */
   private async createAgentHandle(sessionId: string): Promise<AgentHandleLike> {
     try {
-      return await this.ctx.agents.create(await this.createOptions(sessionId))
+      const handle = await this.ctx.agents.create(await this.createOptions(sessionId))
+      this.setSessionTitle(handle, sessionId)
+      return handle
     } catch (error) {
       const message = String((error as { message?: unknown })?.message ?? error)
       if (!SESSION_COLLISION_RE.test(message)) throw error
@@ -325,6 +328,7 @@ export class AgentBridge {
         try {
           const resumed = await this.ctx.agents.resume(await this.resumeOptions(sessionId))
           this.logger.warn(`[wecom-bot] 会话 ${sessionId} 创建冲突(${message.slice(0, 80)}),已 resume 续接原会话`)
+          this.setSessionTitle(resumed, sessionId)
           return resumed
         } catch (resumeError) {
           const resumeMessage = String((resumeError as { message?: unknown })?.message ?? resumeError)
@@ -334,6 +338,22 @@ export class AgentBridge {
       const alt = sessionId + '#' + Date.now().toString(36)
       this.logger.warn(`[wecom-bot] 会话 ${sessionId} 创建冲突(${message.slice(0, 80)}),改用 ${alt} 重试`)
       return this.ctx.agents.create(await this.createOptions(alt))
+    }
+  }
+
+  /**
+   * 给会话设置显式标题「企微 #<数字>」,与企微回复中回显的会话标识一致,
+   * 便于在 dsh 记录中识别/复盘。session-title 服务随 dsh-base 挂载
+   * (ctx.get('sessionTitle'));未挂载或失败时静默降级,不影响会话运行。
+   */
+  private setSessionTitle(handle: AgentHandleLike, sessionId: string): void {
+    try {
+      const titles = this.ctx.get<SessionTitleServiceLike>('sessionTitle')
+      if (!titles || typeof titles.rename !== 'function') return
+      const token = sessionId.slice(this.cfg.sessionIdPrefix.length + 1)
+      titles.rename(handle.agent.session, `企微 #${token}`)
+    } catch (error) {
+      this.logger.warn(`[wecom-bot] 会话标题设置失败(${sessionId}): ${errMessage(error).slice(0, 120)}`)
     }
   }
 

@@ -62,6 +62,15 @@ export interface AgentPresetsServiceLike {
   mount(agentCtx: unknown, id: string): Promise<void>
 }
 
+/** ctx.get('sessionTitle') 服务的最小接口面(与 dsh-session-title 对齐,随 dsh-base 挂载) */
+export interface SessionTitleServiceLike {
+  /**
+   * 以 user 源写入标题(钉住:自动标题生成不再覆盖),返回规范化后的标题。
+   * 要求传入**活的**会话对象(agent 句柄的 session)。
+   */
+  rename(session: unknown, title: string): { title: string }
+}
+
 /** session/event 事件的结构形状(只需 assistant/message 与 turn/end 的字段) */
 export interface SessionEventLike {
   type: string

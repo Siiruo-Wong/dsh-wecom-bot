@@ -62,9 +62,14 @@ function makeHarness(overrides: Partial<AgentBridgeConfig> = {}, preseed?: Agent
     resolve: vi.fn(async () => ({ id: 'code' })),
     mount: vi.fn(async () => {}),
   }
+  const sessionTitle = { rename: vi.fn(() => ({ title: 'x', eventSeq: 0 })) }
   const ctx = {
     agents,
-    get: vi.fn((key: string) => key === 'agentPresets' ? agentPresets : undefined),
+    get: vi.fn((key: string) => {
+      if (key === 'agentPresets') return agentPresets
+      if (key === 'sessionTitle') return sessionTitle
+      return undefined
+    }),
     on(event: string, handler: (...args: unknown[]) => void) {
       const list = listeners.get(event) ?? []
       list.push(handler)
@@ -101,6 +106,7 @@ function makeHarness(overrides: Partial<AgentBridgeConfig> = {}, preseed?: Agent
     },
     logger,
     agentPresets,
+    sessionTitle,
     ctx,
   }
 }
@@ -123,6 +129,11 @@ describe('AgentBridge', () => {
     expect(h.created[0]?.sessionId).toBe('wecom:user1')
     expect(h.created[0]?.meta).toEqual({ cwd: '/tmp/ws', agentPreset: 'code' })
     expect(h.follows[0]?.content[0]?.text).toBe('你好')
+    // 新会话立即以「企微 #<数字>」命名,与企微回复回显的标识一致
+    expect(h.sessionTitle.rename).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'wecom:user1' }),
+      '企微 #user1',
+    )
 
     h.emit('session/event', { id: 'wecom:user1' }, {
       type: 'assistant/message',
@@ -161,6 +172,8 @@ describe('AgentBridge', () => {
     await tick()
     expect(h.created).toHaveLength(1)
     expect(h.follows).toHaveLength(2)
+    // 复用已有句柄时不重复命名
+    expect(h.sessionTitle.rename).toHaveBeenCalledTimes(1)
   })
 
   it('队列深度上限:超出直接提示繁忙,不创建多余会话', async () => {
@@ -407,8 +420,10 @@ describe('lastAssistantText error surfacing', () => {
       },
     }
 
+    const sessionTitle = { rename: vi.fn(() => ({ title: 'x', eventSeq: 0 })) }
     const ctx = {
       agents,
+      get: vi.fn((key: string) => key === 'sessionTitle' ? sessionTitle : undefined),
       on(event: string, handler: (...args: unknown[]) => void) {
         const list = listeners.get(event) ?? []
         list.push(handler)
@@ -431,6 +446,11 @@ describe('lastAssistantText error surfacing', () => {
     expect(resumed[0]?.resumeSessionId).toBe('wecom:user1')
     expect(created).toHaveLength(0)
     expect(follows[0]?.content[0]?.text).toBe('你好')
+    // 续接的会话同样以「企微 #<数字>」命名
+    expect(sessionTitle.rename).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'wecom:user1' }),
+      '企微 #user1',
+    )
 
     // 后续事件按原 sessionId 流转,回复正常
     for (const handler of listeners.get('session/event') ?? []) {
@@ -592,6 +612,8 @@ describe('lastAssistantText error surfacing', () => {
     expect(h.created).toHaveLength(0)
     expect(liveFollows).toHaveLength(1)
     expect(liveFollows[0]?.content[0]?.text).toBe('你好')
+    // 复用宿主已有会话:不创建、不命名
+    expect(h.sessionTitle.rename).not.toHaveBeenCalled()
     // 事件按原 sessionId 流转并正常回复
     h.emit('session/event', { id: 'wecom:user1' }, {
       type: 'assistant/message',
