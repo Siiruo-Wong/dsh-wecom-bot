@@ -17,6 +17,7 @@ import { resolve } from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { ConfigError, resolveConfig, type Config } from './config.js'
+import { createSessionCounter, dshHome, splitSessionToken } from './session-key.js'
 import { WECOM_SETTINGS_NAMESPACE, WecomSettingsSchema, type WecomSettings } from './settings.js'
 import { decryptWecomMessage, verifySignature } from './crypto.js'
 import { WecomApi } from './wecom-api.js'
@@ -80,6 +81,7 @@ export class WecomBot extends Service {
   private readonly wecom?: WecomApi
   private longconn?: WecomLongConn
   private readonly server?: CallbackServer
+  private readonly nextSession: () => string
   private settingsScope?: SettingsScopeLike<WecomSettings>
   private settingsDispose?: () => void
 
@@ -87,6 +89,10 @@ export class WecomBot extends Service {
     super(ctx, 'wecomBot')
     const cfg = resolveConfig(raw)
     this.cfg = cfg
+    // 递增会话号分配器(持久化于 $DSH_HOME/wecom-bot/session-seq,重启不归零)
+    this.nextSession = createSessionCounter(dshHome(), (error) =>
+      ctx.logger.warn('[wecom-bot] 会话计数持久化失败', error),
+    )
     const agents = (ctx as unknown as { agents?: AgentsServiceLike }).agents
     if (!agents) {
       throw new ConfigError('当前环境未提供 agent 服务(ctx.agents):请确认插件运行在具备 agent 核心的 dsh profile(web/desktop)中')
@@ -131,7 +137,11 @@ export class WecomBot extends Service {
     }
 
     if (needLongConn) {
-      this.longconn = new WecomLongConn(cfg, { bridge: this.bridge, logger: ctx.logger })
+      this.longconn = new WecomLongConn(cfg, {
+        bridge: this.bridge,
+        logger: ctx.logger,
+        nextSession: this.nextSession,
+      })
     }
 
     // 用户设置命名空间:base = 装配配置,用户层 = UI 写入;变更时热更新。
@@ -236,7 +246,11 @@ export class WecomBot extends Service {
     if (connectionChanged && this.longconn) {
       const logger = this.ctx.logger
       const oldConn = this.longconn
-      this.longconn = new WecomLongConn(next, { bridge: this.bridge, logger })
+      this.longconn = new WecomLongConn(next, {
+        bridge: this.bridge,
+        logger,
+        nextSession: this.nextSession,
+      })
       void oldConn.dispose().then(() => {
         logger.info('[wecom-bot] 已按新 botId/botSecret 重建长连接')
       })
@@ -263,9 +277,11 @@ export class WecomBot extends Service {
       }
       return
     }
-    const content = message.content.slice(0, this.cfg.inputLimitChars)
+    // 显式会话标识:带 #s-<数字> 续接原会话;不带则分配新会话(递增号,独立上下文)
+    const { token, rest } = splitSessionToken(message.content)
+    const content = rest.slice(0, this.cfg.inputLimitChars)
     const task = [this.cfg.taskPrefix, content].filter(Boolean).join('\n')
-    const key = message.chatId ?? message.fromUser
+    const key = token ?? this.nextSession()
     const target: ReplyTarget = message.chatId ? { chatid: message.chatId } : { touser: message.fromUser }
     this.bridge.enqueue(key, task, target)
   }

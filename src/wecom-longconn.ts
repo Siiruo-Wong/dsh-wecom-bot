@@ -13,6 +13,7 @@ import AiBot from '@wecom/aibot-node-sdk'
 import type { AgentBridge } from './agent-bridge.js'
 import { truncateUtf8 } from './agent-bridge.js'
 import type { Config } from './config.js'
+import { splitSessionToken } from './session-key.js'
 import type { LoggerLike, LongConnClientLike, LongConnFrameLike, ReplyTarget } from './types.js'
 
 const NON_TEXT_TYPES = ['message.image', 'message.mixed', 'message.voice', 'message.file', 'message.video'] as const
@@ -20,12 +21,15 @@ const NON_TEXT_TYPES = ['message.image', 'message.mixed', 'message.voice', 'mess
 export interface WecomLongConnDeps {
   bridge: AgentBridge
   logger: LoggerLike
+  /** 分配下一个新会话标识(不带 #s- 标识的消息使用);带标识的消息直接续接。 */
+  nextSession: () => string
 }
 
 export class WecomLongConn {
   private readonly client: LongConnClientLike
   private readonly bridge: AgentBridge
   private readonly logger: LoggerLike
+  private readonly nextSession: () => string
   /** 运行配置;updateCfg() 会换引用,故不能 readonly。 */
   private cfg: Config
   private readonly cleanups: Array<() => void> = []
@@ -36,6 +40,7 @@ export class WecomLongConn {
     this.cfg = cfg
     this.bridge = deps.bridge
     this.logger = deps.logger
+    this.nextSession = deps.nextSession
     this.client =
       client ??
       new AiBot.WSClient({
@@ -127,11 +132,12 @@ export class WecomLongConn {
     const body = frame.body
     const content = body?.text?.content
     if (!content) return
-    const user = body?.from?.userid
-    const key = body?.chatid ?? user
     const reqId = frame.headers?.req_id
-    if (!key || !reqId) return
-    const task = [this.cfg.taskPrefix, content.slice(0, this.cfg.inputLimitChars)].filter(Boolean).join('\n')
+    if (!reqId) return
+    // 显式会话标识:带 #s-<数字> 续接原会话;不带则分配新会话(递增号,独立上下文)
+    const { token, rest } = splitSessionToken(content)
+    const key = token ?? this.nextSession()
+    const task = [this.cfg.taskPrefix, rest.slice(0, this.cfg.inputLimitChars)].filter(Boolean).join('\n')
     const target: ReplyTarget = { reqId, streamId: this.nextStreamId() }
     if (this.cfg.thinkingHint) {
       void this.client

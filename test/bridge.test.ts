@@ -107,6 +107,9 @@ function makeHarness(overrides: Partial<AgentBridgeConfig> = {}, preseed?: Agent
 
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
 
+/** 剥掉回复开头的会话标识行,取正文(标识行形如 "📎 会话标识:#s-<key>") */
+const bodyOf = (content: string): string => content.replace(/^📎 会话标识:#s-[^\n]+\n\n/, '')
+
 afterEach(() => {
   vi.useRealTimers()
 })
@@ -130,7 +133,22 @@ describe('AgentBridge', () => {
 
     expect(h.sends).toHaveLength(1)
     expect(h.sends[0]?.target).toEqual({ touser: 'u1' })
-    expect(h.sends[0]?.content).toBe('收到!')
+    expect(bodyOf(h.sends[0]!.content)).toBe('收到!')
+  })
+
+  it('回复携带会话标识(#s-<key>),可据此续接', async () => {
+    const h = makeHarness()
+    h.bridge.enqueue('7', '你好', { touser: 'u1' })
+    await tick()
+    h.emit('session/event', { id: 'wecom:7' }, {
+      type: 'assistant/message',
+      data: { message: { content: [{ type: 'text', text: '收到!' }] } },
+    })
+    h.emit('agent/status', { agent: { session: { id: 'wecom:7' } }, status: 'idle' })
+    await tick()
+    expect(h.sends).toHaveLength(1)
+    expect(h.sends[0]?.content.startsWith('📎 会话标识:#s-7')).toBe(true)
+    expect(h.sends[0]?.content).toContain('收到!')
   })
 
   it('多轮:同一会话复用同一 agent,不重复创建', async () => {
@@ -321,7 +339,7 @@ describe('lastAssistantText error surfacing', () => {
     }
     await tick()
     expect(sends).toHaveLength(1)
-    expect(sends[0]?.content).toBe('冲突后仍工作')
+    expect(bodyOf(sends[0]!.content)).toBe('冲突后仍工作')
     await bridge.dispose()
   })
 
@@ -355,7 +373,7 @@ describe('lastAssistantText error surfacing', () => {
     h.emit('agent/status', { agent: { session: { id: h.created[1]?.sessionId } }, status: 'idle' })
     await tick()
     expect(h.sends).toHaveLength(1)
-    expect(h.sends[0]?.content).toBe('冲突自愈成功')
+    expect(bodyOf(h.sends[0]!.content)).toBe('冲突自愈成功')
   })
 
   it('创建冲突时优先 resume 续接原会话(保留记忆),不生成 # 新会话', async () => {
@@ -423,7 +441,7 @@ describe('lastAssistantText error surfacing', () => {
     }
     await tick()
     expect(sends).toHaveLength(1)
-    expect(sends[0]?.content).toBe('续接成功')
+    expect(bodyOf(sends[0]!.content)).toBe('续接成功')
     await bridge.dispose()
   })
 
@@ -486,7 +504,7 @@ describe('lastAssistantText error surfacing', () => {
     }
     await tick()
     expect(sends).toHaveLength(1)
-    expect(sends[0]?.content).toBe('兜底仍工作')
+    expect(bodyOf(sends[0]!.content)).toBe('兜底仍工作')
     await bridge.dispose()
   })
 
@@ -582,7 +600,7 @@ describe('lastAssistantText error surfacing', () => {
     h.emit('agent/status', { agent: { session: { id: 'wecom:user1' } }, status: 'idle' })
     await tick()
     expect(h.sends).toHaveLength(1)
-    expect(h.sends[0]?.content).toBe('沿用上下文回复')
+    expect(bodyOf(h.sends[0]!.content)).toBe('沿用上下文回复')
     await h.bridge.dispose()
   })
 
@@ -643,6 +661,6 @@ describe('lastAssistantText error surfacing', () => {
     }
     await tick()
     expect(sends).toHaveLength(1)
-    expect(sends[0]?.content).toBe('冲突后仍工作')
+    expect(bodyOf(sends[0]!.content)).toBe('冲突后仍工作')
     await bridge.dispose()
   })

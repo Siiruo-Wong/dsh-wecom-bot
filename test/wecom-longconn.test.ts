@@ -55,8 +55,10 @@ function makeHarness(overrides: Record<string, unknown> = {}) {
   const bridge = makeBridge()
   const logger = makeLogger()
   const cfg = resolveConfig({ botId: 'bot-1', botSecret: 'sec-1', ...overrides } as never)
-  const adapter = new WecomLongConn(cfg, { bridge, logger }, client as unknown as LongConnClientLike)
-  return { client, bridge, logger, cfg, adapter }
+  let seq = 0
+  const nextSession = vi.fn(() => String(++seq))
+  const adapter = new WecomLongConn(cfg, { bridge, logger, nextSession }, client as unknown as LongConnClientLike)
+  return { client, bridge, logger, cfg, adapter, nextSession }
 }
 
 const textFrame = (reqId: string, body: Record<string, unknown>) => ({
@@ -79,7 +81,7 @@ describe('WecomLongConn', () => {
 
     expect(h.bridge.enqueue).toHaveBeenCalledTimes(1)
     const [key, task, target] = h.bridge.enqueue.mock.calls[0] as [string, string, ReplyTarget]
-    expect(key).toBe('chat-1')
+    expect(key).toBe('1') // 不带标识 → 递增新会话号
     expect(task).toBe('你好')
     expect(target.reqId).toBe('req-1')
     expect(target.streamId).toBeTruthy()
@@ -99,7 +101,29 @@ describe('WecomLongConn', () => {
       text: { content: 'hi' },
     }))
     const [key] = h.bridge.enqueue.mock.calls[0] as [string]
-    expect(key).toBe('u9')
+    expect(key).toBe('1')
+  })
+
+  it('带 #s-<数字>:续接该会话并剥离标识;不带标识:每条消息递增新会话', () => {
+    const h = makeHarness()
+    h.adapter.start()
+
+    // 带标识 → key = 标识,任务文本去掉标识
+    h.client.emit('message.text', textFrame('req-a', { chatid: 'chat-9', from: { userid: 'u2' }, text: { content: '#s-7 继续分析' } }))
+    let [key, task] = h.bridge.enqueue.mock.calls[0] as [string, string]
+    expect(key).toBe('7')
+    expect(task).toBe('继续分析')
+
+    // 不带标识 → 递增新会话号(与 chatid/userid 无关)
+    h.client.emit('message.text', textFrame('req-b', { chatid: 'chat-9', from: { userid: 'u2' }, text: { content: '新问题' } }))
+    ;[key, task] = h.bridge.enqueue.mock.calls[1] as [string, string]
+    expect(key).toBe('1')
+    expect(task).toBe('新问题')
+
+    // 连续不带标识 → 每次都是新会话号
+    h.client.emit('message.text', textFrame('req-c', { chatid: 'chat-9', from: { userid: 'u2' }, text: { content: '又一个' } }))
+    const key3 = (h.bridge.enqueue.mock.calls[2] as [string])[0]
+    expect(key3).toBe('2')
   })
 
   it('text 消息缺失内容/req_id 时忽略', () => {
