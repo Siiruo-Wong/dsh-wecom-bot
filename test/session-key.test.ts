@@ -21,22 +21,26 @@ describe('splitSessionToken', () => {
     expect(splitSessionToken('你好,帮我查一下 QPS')).toEqual({ rest: '你好,帮我查一下 QPS' })
   })
 
-  it('带 #s-数字:剥离标识并返回 token', () => {
-    expect(splitSessionToken('#s-7 继续分析')).toEqual({ token: '7', rest: '继续分析' })
+  it('带 #数字:剥离标识并返回 token', () => {
+    expect(splitSessionToken('#7 继续分析')).toEqual({ token: '7', rest: '继续分析' })
   })
 
   it('标识后无空格也可解析', () => {
-    expect(splitSessionToken('#s-42继续')).toEqual({ token: '42', rest: '继续' })
+    expect(splitSessionToken('#42继续')).toEqual({ token: '42', rest: '继续' })
   })
 
   it('容忍前导空白', () => {
-    expect(splitSessionToken('  #s-100 查一下')).toEqual({ token: '100', rest: '查一下' })
+    expect(splitSessionToken('  #100 查一下')).toEqual({ token: '100', rest: '查一下' })
   })
 
-  it('不在开头/非纯数字/位数随意但不匹配时不剥离', () => {
-    expect(splitSessionToken('内容 #s-7 不在开头')).toEqual({ rest: '内容 #s-7 不在开头' })
-    expect(splitSessionToken('#s-abc 不是数字')).toEqual({ rest: '#s-abc 不是数字' })
-    expect(splitSessionToken('#s- 空数字')).toEqual({ rest: '#s- 空数字' })
+  it('不在开头/非纯数字/空数字不匹配', () => {
+    expect(splitSessionToken('内容 #7 不在开头')).toEqual({ rest: '内容 #7 不在开头' })
+    expect(splitSessionToken('#abc 不是数字')).toEqual({ rest: '#abc 不是数字' })
+    expect(splitSessionToken('# 空数字')).toEqual({ rest: '# 空数字' })
+  })
+
+  it('旧格式 #s-<数字> 不再识别,按普通消息处理', () => {
+    expect(splitSessionToken('#s-7 继续')).toEqual({ rest: '#s-7 继续' })
   })
 })
 

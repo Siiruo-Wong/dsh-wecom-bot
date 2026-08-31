@@ -104,12 +104,12 @@ describe('WecomLongConn', () => {
     expect(key).toBe('1')
   })
 
-  it('带 #s-<数字>:续接该会话并剥离标识;不带标识:每条消息递增新会话', () => {
+  it('带 #<数字>:续接该会话并剥离标识;不带标识:每条消息递增新会话', () => {
     const h = makeHarness()
     h.adapter.start()
 
     // 带标识 → key = 标识,任务文本去掉标识
-    h.client.emit('message.text', textFrame('req-a', { chatid: 'chat-9', from: { userid: 'u2' }, text: { content: '#s-7 继续分析' } }))
+    h.client.emit('message.text', textFrame('req-a', { chatid: 'chat-9', from: { userid: 'u2' }, text: { content: '#7 继续分析' } }))
     let [key, task] = h.bridge.enqueue.mock.calls[0] as [string, string]
     expect(key).toBe('7')
     expect(task).toBe('继续分析')

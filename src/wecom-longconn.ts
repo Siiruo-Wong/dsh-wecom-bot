@@ -21,7 +21,7 @@ const NON_TEXT_TYPES = ['message.image', 'message.mixed', 'message.voice', 'mess
 export interface WecomLongConnDeps {
   bridge: AgentBridge
   logger: LoggerLike
-  /** 分配下一个新会话标识(不带 #s- 标识的消息使用);带标识的消息直接续接。 */
+  /** 分配下一个新会话标识(不带 # 标识的消息使用);带标识的消息直接续接。 */
   nextSession: () => string
 }
 
@@ -134,7 +134,7 @@ export class WecomLongConn {
     if (!content) return
     const reqId = frame.headers?.req_id
     if (!reqId) return
-    // 显式会话标识:带 #s-<数字> 续接原会话;不带则分配新会话(递增号,独立上下文)
+    // 显式会话标识:带 #<数字> 续接原会话;不带则分配新会话(递增号,独立上下文)
     const { token, rest } = splitSessionToken(content)
     const key = token ?? this.nextSession()
     const task = [this.cfg.taskPrefix, rest.slice(0, this.cfg.inputLimitChars)].filter(Boolean).join('\n')

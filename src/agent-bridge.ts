@@ -2,7 +2,7 @@
  * 进程内 dsh agent 桥接。
  *
  * 设计:
- * - 会话标识显式化:消息带 `#s-<数字>` 续接该会话;不带则默认开新会话(独立上下文);
+ * - 会话标识显式化:消息带 `#<数字>` 续接该会话;不带则默认开新会话(独立上下文);
  * - 每个会话(用户/群/话题)一条 FIFO 队列 + 深度上限,超出直接提示繁忙;
  * - 同一会话复用同一 sessionId(agent),天然获得多轮上下文(JSONL 持久化由宿主提供);
  * - 通过 session/event 收集本轮事件,agent 空闲(idle)时取最后一条 assistant/message 作为答复;
@@ -350,7 +350,7 @@ export class AgentBridge {
     void this.finishTurn(sessionId, state)
   }
 
-  /** 会话标识(回复时回显,用户带 #s-<标识> 可继续本话题) */
+  /** 会话标识(回复时回显,用户带 #<标识> 可继续本话题) */
   private sessionToken(sessionId: string): string {
     return sessionId.slice(this.cfg.sessionIdPrefix.length + 1)
   }
@@ -393,7 +393,7 @@ export class AgentBridge {
         ? '\n\n(⚠️ 已达输出上限,回复可能不完整)'
         : ''
     const body = text || '(模型没有返回文本)'
-    const content = `📎 会话标识:#s-${this.sessionToken(sessionId)}\n\n${body}${note}`
+    const content = `📎 会话标识:#${this.sessionToken(sessionId)}\n\n${body}${note}`
     void this.reply(prompt.target, content)
     void this.pump(sessionId)
   }
@@ -407,7 +407,7 @@ export class AgentBridge {
     const handle = state.handle
     state.handle = null
     if (handle) void handle.dispose().catch(() => {})
-    void this.reply(prompt.target, `📎 会话标识:#s-${this.sessionToken(sessionId)}\n\n⏱️ 处理超时,请稍后重试。`)
+    void this.reply(prompt.target, `📎 会话标识:#${this.sessionToken(sessionId)}\n\n⏱️ 处理超时,请稍后重试。`)
     void this.pump(sessionId)
   }
 

@@ -277,7 +277,7 @@ export class WecomBot extends Service {
       }
       return
     }
-    // 显式会话标识:带 #s-<数字> 续接原会话;不带则分配新会话(递增号,独立上下文)
+    // 显式会话标识:带 #<数字> 续接原会话;不带则分配新会话(递增号,独立上下文)
     const { token, rest } = splitSessionToken(message.content)
     const content = rest.slice(0, this.cfg.inputLimitChars)
     const task = [this.cfg.taskPrefix, content].filter(Boolean).join('\n')

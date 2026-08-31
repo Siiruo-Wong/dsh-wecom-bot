@@ -2,7 +2,7 @@
  * 显式会话标识管理。
  *
  * 规则:
- * - 消息以 `#s-<数字>` 开头 → 续接该会话(复用/resume,保留多轮记忆);
+ * - 消息以 `#<数字>` 开头 → 续接该会话(复用/resume,保留多轮记忆);
  * - 不带标识 → 自动分配一个**递增数字**的新会话标识(独立上下文,零串味)。
  *
  * 递增计数器持久化在 `<dsh home>/wecom-bot/session-seq`(默认 `~/.dsh`),
@@ -12,12 +12,12 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-/** `#s-` + 数字;数字后要求非数字或结尾,避免误吞后续文本(如 `#s-7继续`) */
-const SESSION_TOKEN_RE = /^\s*#s-(\d+)(?=\D|$)/
+/** `#` + 数字;数字后要求非数字或结尾,避免误吞后续文本(如 `#7继续`) */
+const SESSION_TOKEN_RE = /^\s*#(\d+)(?=\D|$)/
 
 /**
  * 从消息文本中剥离开头的会话标识。
- * @returns token 存在时为 `#s-` 后的数字串;rest 为去掉标识后的剩余文本。
+ * @returns token 存在时为 `#` 后的数字串;rest 为去掉标识后的剩余文本。
  */
 export function splitSessionToken(text: string): { token?: string; rest: string } {
   const match = SESSION_TOKEN_RE.exec(text)

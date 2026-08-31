@@ -107,8 +107,8 @@ function makeHarness(overrides: Partial<AgentBridgeConfig> = {}, preseed?: Agent
 
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
 
-/** 剥掉回复开头的会话标识行,取正文(标识行形如 "📎 会话标识:#s-<key>") */
-const bodyOf = (content: string): string => content.replace(/^📎 会话标识:#s-[^\n]+\n\n/, '')
+/** 剥掉回复开头的会话标识行,取正文(标识行形如 "📎 会话标识:#<key>") */
+const bodyOf = (content: string): string => content.replace(/^📎 会话标识:#[^\n]+\n\n/, '')
 
 afterEach(() => {
   vi.useRealTimers()
@@ -136,7 +136,7 @@ describe('AgentBridge', () => {
     expect(bodyOf(h.sends[0]!.content)).toBe('收到!')
   })
 
-  it('回复携带会话标识(#s-<key>),可据此续接', async () => {
+  it('回复携带会话标识(#<key>),可据此续接', async () => {
     const h = makeHarness()
     h.bridge.enqueue('7', '你好', { touser: 'u1' })
     await tick()
@@ -147,7 +147,7 @@ describe('AgentBridge', () => {
     h.emit('agent/status', { agent: { session: { id: 'wecom:7' } }, status: 'idle' })
     await tick()
     expect(h.sends).toHaveLength(1)
-    expect(h.sends[0]?.content.startsWith('📎 会话标识:#s-7')).toBe(true)
+    expect(h.sends[0]?.content.startsWith('📎 会话标识:#7')).toBe(true)
     expect(h.sends[0]?.content).toContain('收到!')
   })
 
