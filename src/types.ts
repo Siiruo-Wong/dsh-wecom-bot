@@ -41,6 +41,16 @@ export interface AgentsServiceLike {
     /** 创建期挂载 agent 预设(system prompt/工具目录等),与 web 会话一致 */
     setup?: (agentCtx: unknown) => Promise<void>
   }): Promise<AgentHandleLike>
+  /**
+   * 从持久化日志恢复一个既有会话并续接(应用重启后同 id 再创建会触发
+   * "already has a persisted log" 冲突,resume 是官方续接路径,保留全部历史)。
+   * 会话 cwd/预设取持久化头部,与 create 的 meta 无关。
+   */
+  resume(options: {
+    resumeSessionId: string
+    agentOptions?: { provider?: string; model?: string; maxTokens?: number }
+    setup?: (agentCtx: unknown) => Promise<void>
+  }): Promise<AgentHandleLike>
   get(id: string): AgentLike | undefined
 }
 

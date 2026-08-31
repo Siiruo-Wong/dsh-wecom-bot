@@ -51,6 +51,15 @@ interface SessionState {
   collisionRetried?: boolean
 }
 
+/**
+ * 会话创建/持久化冲突特征,覆盖三类来源:
+ * - SessionStore 活跃会话冲突(session ... already exists);
+ * - 持久化 coordinator 已存在日志(refusing to materialize / already has a persisted log);
+ * - agent-loop 的 does not match this live session。
+ * 命中后按既有自愈路径换新 sessionId 原样重试一次。
+ */
+const SESSION_COLLISION_RE = /collision|already exists|persisted log|refusing to materialize|does not match this live session/i
+
 /** 构造一条用户消息(与 dsh-llm createUserMessage 的形状一致) */
 export function buildUserMessage(task: string): UserMessageLike {
   return {
@@ -208,6 +217,19 @@ export class AgentBridge {
       this.agentToSession.delete(state.handle.agent.id)
       state.handle = null
     }
+    // 宿主进程里已有同 id 的活跃 agent(例如 GUI 恢复了该会话):直接复用,
+    // 保住多轮上下文,避免 agents.create 撞上 "session already exists"。
+    const live = this.ctx.agents.get(sessionId)
+    if (live) {
+      const shared: AgentHandleLike = {
+        agent: live,
+        // 共享句柄:不销毁宿主拥有的 agent,只解除本桥的引用
+        dispose: async () => {},
+      }
+      state.handle = shared
+      this.agentToSession.set(live.id, sessionId)
+      return shared
+    }
     if (state.creating) return state.creating
     const creating = this.createAgentHandle(state.agentId ?? sessionId)
     state.creating = creating
@@ -268,18 +290,49 @@ export class AgentBridge {
     }
   }
 
-  /** 会话创建冲突(磁盘持久化会话与内存状态错位)时自动换新 sessionId 重试一次。 */
+  /** 组装一次 agents.resume 的参数(resume 从持久化头部取 cwd/预设,无需 meta)。 */
+  private async resumeOptions(sessionId: string): Promise<{
+    resumeSessionId: string
+    agentOptions: { provider?: string; model?: string; maxTokens?: number }
+    setup?: (agentCtx: unknown) => Promise<void>
+  }> {
+    const preset = await this.resolvePreset()
+    return {
+      resumeSessionId: sessionId,
+      agentOptions: {
+        ...(this.cfg.provider ? { provider: this.cfg.provider } : {}),
+        ...(this.cfg.model ? { model: this.cfg.model } : {}),
+        ...(this.cfg.maxTokens ? { maxTokens: this.cfg.maxTokens } : {}),
+      },
+      ...(preset.setup ? { setup: preset.setup } : {}),
+    }
+  }
+
+  /**
+   * 会话创建冲突(磁盘持久化会话与内存状态错位,常见于应用重启后)自愈:
+   * 1. 优先 resume 原 sessionId —— 续接持久化日志,保留全部多轮记忆;
+   * 2. resume 不可用/失败(宿主较旧、日志损坏等)时,兜底换新 sessionId 原样重试一次。
+   */
   private async createAgentHandle(sessionId: string): Promise<AgentHandleLike> {
     try {
       return await this.ctx.agents.create(await this.createOptions(sessionId))
     } catch (error) {
       const message = String((error as { message?: unknown })?.message ?? error)
-      if (/collision|persisted log|does not match this live session/i.test(message)) {
-        const alt = sessionId + '#' + Date.now().toString(36)
-        this.logger.warn(`[wecom-bot] 会话 ${sessionId} 创建冲突(${message.slice(0, 80)}),改用 ${alt} 重试`)
-        return this.ctx.agents.create(await this.createOptions(alt))
+      if (!SESSION_COLLISION_RE.test(message)) throw error
+      // 优先续接原会话:同 id 的持久化日志就是上一进程留下的历史,resume 能完整恢复。
+      if (typeof this.ctx.agents.resume === 'function') {
+        try {
+          const resumed = await this.ctx.agents.resume(await this.resumeOptions(sessionId))
+          this.logger.warn(`[wecom-bot] 会话 ${sessionId} 创建冲突(${message.slice(0, 80)}),已 resume 续接原会话`)
+          return resumed
+        } catch (resumeError) {
+          const resumeMessage = String((resumeError as { message?: unknown })?.message ?? resumeError)
+          this.logger.warn(`[wecom-bot] 会话 ${sessionId} resume 续接失败(${resumeMessage.slice(0, 80)}),改用新 sessionId 重试`)
+        }
       }
-      throw error
+      const alt = sessionId + '#' + Date.now().toString(36)
+      this.logger.warn(`[wecom-bot] 会话 ${sessionId} 创建冲突(${message.slice(0, 80)}),改用 ${alt} 重试`)
+      return this.ctx.agents.create(await this.createOptions(alt))
     }
   }
 
@@ -310,17 +363,19 @@ export class AgentBridge {
     }
     const { text, reason, errorMessage } = lastAssistantText(state.events)
     // 持久化冲突自愈:同 id 的磁盘会话日志与内存会话错位(常见于应用重启后),
-    // 会话初始化在 turn 期间才抛错,create 期抓不到 → 销毁句柄换新 sessionId 原样重试一次。
+    // 会话初始化在 turn 期间才抛错,create 期抓不到 → 销毁句柄,按原 sessionId
+    // 重走 create→resume 路径续接原会话;resume 失败时 createAgentHandle 会
+    // 兜底换新 sessionId,不会死循环。
     if (
       reason === 'error' && errorMessage && !state.collisionRetried &&
-      /collision|persisted log|does not match this live session/i.test(errorMessage)
+      SESSION_COLLISION_RE.test(errorMessage)
     ) {
       state.collisionRetried = true
-      state.agentId = sessionId + '#' + Date.now().toString(36)
+      state.agentId = undefined
       const handle = state.handle
       state.handle = null
       if (handle) void handle.dispose().catch(() => {})
-      this.logger.warn(`[wecom-bot] 会话 ${sessionId} 持久化冲突,改用 ${state.agentId} 重试本轮`)
+      this.logger.warn(`[wecom-bot] 会话 ${sessionId} 持久化冲突,销毁句柄按原 id 重试本轮(resume 续接)`)
       state.events = []
       state.queue.unshift({ id: prompt.id, task: prompt.task, target: prompt.target })
       void this.pump(sessionId)

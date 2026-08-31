@@ -26,12 +26,12 @@ function makeConfig(overrides: Partial<AgentBridgeConfig> = {}): AgentBridgeConf
   }
 }
 
-function makeHarness(overrides: Partial<AgentBridgeConfig> = {}): Harness {
+function makeHarness(overrides: Partial<AgentBridgeConfig> = {}, preseed?: AgentHandleLike): Harness {
   const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
   const follows: UserMessageLike[] = []
   const created: { sessionId: string; meta: unknown; agentOptions: unknown; setup?: unknown }[] = []
   const sends: { target: ReplyTarget; content: string }[] = []
-  let liveAgent: AgentHandleLike | null = null
+  let liveAgent: AgentHandleLike | null = preseed ?? null
   let disposed = false
 
   const agents: AgentsServiceLike = {
@@ -325,7 +325,7 @@ describe('lastAssistantText error surfacing', () => {
     await bridge.dispose()
   })
 
-  it('turn 期持久化冲突:换新 sessionId 重试同一轮并正常回复', async () => {
+  it('turn 期持久化冲突:销毁句柄按原 sessionId 重试同一轮并正常回复', async () => {
     const h = makeHarness()
     h.bridge.enqueue('user1', '重试我', { touser: 'u1' })
     await tick()
@@ -340,10 +340,9 @@ describe('lastAssistantText error surfacing', () => {
     h.emit('agent/status', { agent: { session: { id: 'wecom:user1' } }, status: 'idle' })
     await tick()
 
-    // 自愈:销毁旧句柄,换新 sessionId 重试同一 prompt,且不向用户回错误
+    // 自愈:销毁旧句柄,按原 sessionId 重走 create(宿主无 resume 时 create 重试成功),不向用户回错误
     expect(h.created).toHaveLength(2)
-    expect(h.created[1]?.sessionId).not.toBe('wecom:user1')
-    expect(h.created[1]?.sessionId).toMatch(/^wecom:user1#/)
+    expect(h.created[1]?.sessionId).toBe('wecom:user1')
     expect(h.follows).toHaveLength(2)
     expect(h.follows[1]?.content[0]?.text).toBe('重试我')
     expect(h.sends).toHaveLength(0)
@@ -357,6 +356,138 @@ describe('lastAssistantText error surfacing', () => {
     await tick()
     expect(h.sends).toHaveLength(1)
     expect(h.sends[0]?.content).toBe('冲突自愈成功')
+  })
+
+  it('创建冲突时优先 resume 续接原会话(保留记忆),不生成 # 新会话', async () => {
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
+    const created: { sessionId: string }[] = []
+    const resumed: { resumeSessionId: string }[] = []
+    const follows: UserMessageLike[] = []
+    const sends: { target: ReplyTarget; content: string }[] = []
+    let liveAgent: AgentHandleLike | null = null
+    let attempts = 0
+
+    const agents: AgentsServiceLike = {
+      async create(options) {
+        attempts++
+        if (attempts === 1) {
+          throw new Error('session "wecom:user1" already has a persisted log on disk that does not match this live session (id collision)')
+        }
+        created.push({ sessionId: options.sessionId })
+        const agent = { id: options.sessionId, session: { id: options.sessionId }, followup(m: UserMessageLike) { follows.push(m) } }
+        liveAgent = { agent, dispose: async () => { liveAgent = null } }
+        return liveAgent
+      },
+      async resume(options) {
+        resumed.push({ resumeSessionId: options.resumeSessionId })
+        const agent = { id: options.resumeSessionId, session: { id: options.resumeSessionId }, followup(m: UserMessageLike) { follows.push(m) } }
+        liveAgent = { agent, dispose: async () => { liveAgent = null } }
+        return liveAgent
+      },
+      get(id) {
+        return liveAgent && liveAgent.agent.id === id ? liveAgent.agent : undefined
+      },
+    }
+
+    const ctx = {
+      agents,
+      on(event: string, handler: (...args: unknown[]) => void) {
+        const list = listeners.get(event) ?? []
+        list.push(handler)
+        listeners.set(event, list)
+        return () => {
+          const arr = listeners.get(event) ?? []
+          const at = arr.indexOf(handler)
+          if (at >= 0) arr.splice(at, 1)
+        }
+      },
+    }
+    const wecom = { sendText: vi.fn(async (target: ReplyTarget, content: string) => { sends.push({ target, content }) }) } as unknown as ReplySender
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }
+    const bridge = new AgentBridge(ctx as never, makeConfig({}), wecom, logger)
+
+    bridge.enqueue('user1', '你好', { touser: 'u1' })
+    await tick()
+    // 冲突后优先 resume 原 sessionId,不再生成 # 新会话
+    expect(resumed).toHaveLength(1)
+    expect(resumed[0]?.resumeSessionId).toBe('wecom:user1')
+    expect(created).toHaveLength(0)
+    expect(follows[0]?.content[0]?.text).toBe('你好')
+
+    // 后续事件按原 sessionId 流转,回复正常
+    for (const handler of listeners.get('session/event') ?? []) {
+      handler({ id: 'wecom:user1' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '续接成功' }] } } })
+    }
+    for (const handler of listeners.get('agent/status') ?? []) {
+      handler({ agent: { session: { id: 'wecom:user1' } }, status: 'idle' })
+    }
+    await tick()
+    expect(sends).toHaveLength(1)
+    expect(sends[0]?.content).toBe('续接成功')
+    await bridge.dispose()
+  })
+
+  it('创建冲突且 resume 失败:兜底换新 sessionId 重试并正常回复', async () => {
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
+    const created: { sessionId: string }[] = []
+    const follows: UserMessageLike[] = []
+    const sends: { target: ReplyTarget; content: string }[] = []
+    let liveAgent: AgentHandleLike | null = null
+    let attempts = 0
+
+    const agents: AgentsServiceLike = {
+      async create(options) {
+        attempts++
+        if (attempts === 1) {
+          throw new Error('session "wecom:user1" already has a persisted log on disk that does not match this live session (id collision)')
+        }
+        created.push({ sessionId: options.sessionId })
+        const agent = { id: options.sessionId, session: { id: options.sessionId }, followup(m: UserMessageLike) { follows.push(m) } }
+        liveAgent = { agent, dispose: async () => { liveAgent = null } }
+        return liveAgent
+      },
+      async resume() {
+        throw new Error('session "wecom:user1" not found')
+      },
+      get(id) {
+        return liveAgent && liveAgent.agent.id === id ? liveAgent.agent : undefined
+      },
+    }
+
+    const ctx = {
+      agents,
+      on(event: string, handler: (...args: unknown[]) => void) {
+        const list = listeners.get(event) ?? []
+        list.push(handler)
+        listeners.set(event, list)
+        return () => {
+          const arr = listeners.get(event) ?? []
+          const at = arr.indexOf(handler)
+          if (at >= 0) arr.splice(at, 1)
+        }
+      },
+    }
+    const wecom = { sendText: vi.fn(async (target: ReplyTarget, content: string) => { sends.push({ target, content }) }) } as unknown as ReplySender
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }
+    const bridge = new AgentBridge(ctx as never, makeConfig({}), wecom, logger)
+
+    bridge.enqueue('user1', '你好', { touser: 'u1' })
+    await tick()
+    // resume 失败 → 兜底 # 新会话
+    expect(created).toHaveLength(1)
+    expect(created[0]?.sessionId).toMatch(/^wecom:user1#/)
+    expect(follows[0]?.content[0]?.text).toBe('你好')
+
+    for (const handler of listeners.get('session/event') ?? []) {
+      handler({ id: created[0]?.sessionId }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '兜底仍工作' }] } } })
+    }
+    for (const handler of listeners.get('agent/status') ?? []) {
+      handler({ agent: { session: { id: created[0]?.sessionId } }, status: 'idle' })
+    }
+    await tick()
+    expect(sends).toHaveLength(1)
+    expect(sends[0]?.content).toBe('兜底仍工作')
+    await bridge.dispose()
   })
 
   it('turn 期持久化冲突只自愈一次:再次冲突按普通错误回复', async () => {
@@ -422,4 +553,96 @@ describe('lastAssistantText error surfacing', () => {
     const rec = h.created[0]!
     expect((rec.meta as { agentPreset?: string }).agentPreset).toBeUndefined()
     expect(rec.setup).toBeUndefined()
+  })
+
+  it('宿主已有同 id 活跃 agent:复用不重复创建,上下文延续', async () => {
+    const liveFollows: UserMessageLike[] = []
+    const preseed: AgentHandleLike = {
+      agent: {
+        id: 'wecom:user1',
+        session: { id: 'wecom:user1' },
+        followup(message) {
+          liveFollows.push(message)
+        },
+      },
+      dispose: async () => {},
+    }
+    const h = makeHarness({}, preseed)
+    h.bridge.enqueue('user1', '你好', { touser: 'u1' })
+    await tick()
+    // 不重复创建:直接复用宿主活跃 agent
+    expect(h.created).toHaveLength(0)
+    expect(liveFollows).toHaveLength(1)
+    expect(liveFollows[0]?.content[0]?.text).toBe('你好')
+    // 事件按原 sessionId 流转并正常回复
+    h.emit('session/event', { id: 'wecom:user1' }, {
+      type: 'assistant/message',
+      data: { message: { content: [{ type: 'text', text: '沿用上下文回复' }] } },
+    })
+    h.emit('agent/status', { agent: { session: { id: 'wecom:user1' } }, status: 'idle' })
+    await tick()
+    expect(h.sends).toHaveLength(1)
+    expect(h.sends[0]?.content).toBe('沿用上下文回复')
+    await h.bridge.dispose()
+  })
+
+  it('创建冲突(活跃会话 already exists):换新 sessionId 重试并正常回复', async () => {
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
+    const created: { sessionId: string }[] = []
+    const follows: UserMessageLike[] = []
+    const sends: { target: ReplyTarget; content: string }[] = []
+    let liveAgent: AgentHandleLike | null = null
+    let attempts = 0
+
+    const agents: AgentsServiceLike = {
+      async create(options) {
+        attempts++
+        if (attempts === 1) {
+          throw new Error('session "wecom:user1" already exists')
+        }
+        created.push({ sessionId: options.sessionId })
+        const agent = { id: options.sessionId, session: { id: options.sessionId }, followup(m: UserMessageLike) { follows.push(m) } }
+        liveAgent = { agent, dispose: async () => { liveAgent = null } }
+        return liveAgent
+      },
+      get(id) {
+        return liveAgent && liveAgent.agent.id === id ? liveAgent.agent : undefined
+      },
+    }
+
+    const ctx = {
+      agents,
+      on(event: string, handler: (...args: unknown[]) => void) {
+        const list = listeners.get(event) ?? []
+        list.push(handler)
+        listeners.set(event, list)
+        return () => {
+          const arr = listeners.get(event) ?? []
+          const at = arr.indexOf(handler)
+          if (at >= 0) arr.splice(at, 1)
+        }
+      },
+    }
+    const wecom = { sendText: vi.fn(async (target: ReplyTarget, content: string) => { sends.push({ target, content }) }) } as unknown as ReplySender
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }
+    const bridge = new AgentBridge(ctx as never, makeConfig({}), wecom, logger)
+
+    bridge.enqueue('user1', '你好', { touser: 'u1' })
+    await tick()
+    // 首次 create 抛 "already exists" → 自愈换新 sessionId 重试
+    expect(created).toHaveLength(1)
+    expect(created[0]?.sessionId).toMatch(/^wecom:user1#/)
+    expect(follows[0]?.content[0]?.text).toBe('你好')
+
+    // 后续事件按新 sessionId 流转,回复正常
+    for (const handler of listeners.get('session/event') ?? []) {
+      handler({ id: created[0]?.sessionId }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '冲突后仍工作' }] } } })
+    }
+    for (const handler of listeners.get('agent/status') ?? []) {
+      handler({ agent: { session: { id: created[0]?.sessionId } }, status: 'idle' })
+    }
+    await tick()
+    expect(sends).toHaveLength(1)
+    expect(sends[0]?.content).toBe('冲突后仍工作')
+    await bridge.dispose()
   })
