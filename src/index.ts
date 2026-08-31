@@ -222,6 +222,9 @@ export class WecomBot extends Service {
 
     const connectionChanged = next.botId !== old.botId || next.botSecret !== old.botSecret
     this.cfg = next
+    // taskPrefix 等由长连接层在每条消息时读取:换引用同步,否则热更新
+    // 永远停留在构造时的旧 cfg(此前只有改 botId/botSecret 才会重建连接)。
+    if (this.longconn) this.longconn.updateCfg(next)
     this.bridge.update({
       workspace: next.workspace,
       provider: next.provider,

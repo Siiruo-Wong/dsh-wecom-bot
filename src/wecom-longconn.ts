@@ -26,7 +26,8 @@ export class WecomLongConn {
   private readonly client: LongConnClientLike
   private readonly bridge: AgentBridge
   private readonly logger: LoggerLike
-  private readonly cfg: Config
+  /** 运行配置;updateCfg() 会换引用,故不能 readonly。 */
+  private cfg: Config
   private readonly cleanups: Array<() => void> = []
   private readonly streamSeq: { n: number } = { n: 0 }
   private started = false
@@ -49,6 +50,16 @@ export class WecomLongConn {
         requestTimeout: cfg.requestTimeoutMs,
         logger: deps.logger,
       })
+  }
+
+  /**
+   * 热更新运行配置:引用替换,不重建连接。
+   * 构造时持有的是装配配置对象;settings 热更新经此换入新对象,
+   * 使逐条读取的 taskPrefix / thinkingHint / inputLimitChars 等立即生效
+   * (此前只有改 botId/botSecret 才会重建长连接,提示词热更新永远落空)。
+   */
+  updateCfg(cfg: Config): void {
+    this.cfg = cfg
   }
 
   /** 建立连接并开始监听(幂等) */

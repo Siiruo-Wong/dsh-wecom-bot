@@ -155,6 +155,21 @@ describe('WecomLongConn', () => {
     expect(h.bridge.enqueue).toHaveBeenCalledTimes(1)
   })
 
+  it('updateCfg 热更新 taskPrefix:后续消息拼新提示词,连接不重建', () => {
+    const h = makeHarness({ taskPrefix: '旧提示词' })
+    h.adapter.start()
+    const clientBefore = h.client
+
+    h.adapter.updateCfg(resolveConfig({ botId: 'bot-1', botSecret: 'sec-1', taskPrefix: '新提示词' } as never))
+    h.client.emit('message.text', textFrame('req-8', { from: { userid: 'u1' }, text: { content: '你好' } }))
+
+    const task = (h.bridge.enqueue.mock.calls[0] as [string, string])[1]
+    expect(task).toBe('新提示词\n你好')
+    // 仅换配置引用:不重建连接/不重连
+    expect(h.client).toBe(clientBefore)
+    expect(h.client.connected).toBe(true)
+  })
+
   it('连接状态事件走日志', () => {
     const h = makeHarness()
     h.adapter.start()
