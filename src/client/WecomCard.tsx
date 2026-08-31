@@ -5,6 +5,7 @@
  * 自包含实现(不依赖 ui-settings-plugins 的卡片外观):纯内联样式 + 自有暂存表单。
  */
 import { useState } from 'react'
+import { IconChevronDownOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { WecomCardState, ProviderEntry } from './wecom-card-controller.ts'
 import type { WecomLocaleKey } from './locales.ts'
 
@@ -221,7 +222,14 @@ export function WecomCard(props: WecomCardProps) {
       >
         <span style={{ flex: 1 }}>{t('wecomTitle')}</span>
         {state.dirty ? <span style={badgeStyle}>{t('unsaved')}</span> : null}
-        <span>{open ? t('collapse') : t('expand')}</span>
+        <span style={{
+          display: 'inline-flex',
+          color: 'var(--dsw-alias-label-secondary, #666)',
+          transition: 'transform 0.15s ease',
+          transform: open ? 'rotate(180deg)' : 'rotate(0deg)',
+        }}>
+          <IconChevronDownOutline14 />
+        </span>
       </button>
       {open
         ? (

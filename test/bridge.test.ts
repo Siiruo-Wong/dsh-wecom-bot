@@ -315,3 +315,60 @@ describe('lastAssistantText error surfacing', () => {
     expect(sends[0]?.content).toBe('冲突后仍工作')
     await bridge.dispose()
   })
+
+  it('turn 期持久化冲突:换新 sessionId 重试同一轮并正常回复', async () => {
+    const h = makeHarness()
+    h.bridge.enqueue('user1', '重试我', { touser: 'u1' })
+    await tick()
+    expect(h.created).toHaveLength(1)
+    expect(h.follows).toHaveLength(1)
+
+    // 第一轮:turn 以持久化冲突错误结束
+    h.emit('session/event', { id: 'wecom:user1' }, {
+      type: 'turn/end',
+      data: { reason: { kind: 'error', error: { message: 'session "wecom:user1" already has a persisted log on disk that does not match this live session (id collision)' } } },
+    })
+    h.emit('agent/status', { agent: { session: { id: 'wecom:user1' } }, status: 'idle' })
+    await tick()
+
+    // 自愈:销毁旧句柄,换新 sessionId 重试同一 prompt,且不向用户回错误
+    expect(h.created).toHaveLength(2)
+    expect(h.created[1]?.sessionId).not.toBe('wecom:user1')
+    expect(h.created[1]?.sessionId).toMatch(/^wecom:user1#/)
+    expect(h.follows).toHaveLength(2)
+    expect(h.follows[1]?.content[0]?.text).toBe('重试我')
+    expect(h.sends).toHaveLength(0)
+
+    // 第二轮正常完成 → 正常回复
+    h.emit('session/event', { id: h.created[1]?.sessionId }, {
+      type: 'assistant/message',
+      data: { message: { content: [{ type: 'text', text: '冲突自愈成功' }] } },
+    })
+    h.emit('agent/status', { agent: { session: { id: h.created[1]?.sessionId } }, status: 'idle' })
+    await tick()
+    expect(h.sends).toHaveLength(1)
+    expect(h.sends[0]?.content).toBe('冲突自愈成功')
+  })
+
+  it('turn 期持久化冲突只自愈一次:再次冲突按普通错误回复', async () => {
+    const h = makeHarness()
+    h.bridge.enqueue('user1', 'x', { touser: 'u1' })
+    await tick()
+    const collide = { type: 'turn/end', data: { reason: { kind: 'error', error: { message: 'session "wecom:user1" already has a persisted log on disk that does not match this live session (id collision)' } } } }
+    const idle = (id: string) => ({ agent: { session: { id } }, status: 'idle' as const })
+
+    // 第一轮冲突 → 自愈重试
+    h.emit('session/event', { id: 'wecom:user1' }, collide)
+    h.emit('agent/status', idle('wecom:user1'))
+    await tick()
+    expect(h.created).toHaveLength(2)
+    expect(h.sends).toHaveLength(0)
+
+    // 第二轮又冲突 → 不再重试,直接回复错误
+    h.emit('session/event', { id: h.created[1]?.sessionId }, collide)
+    h.emit('agent/status', idle(h.created[1]?.sessionId as string))
+    await tick()
+    expect(h.created).toHaveLength(2) // 没有第三次创建
+    expect(h.sends).toHaveLength(1)
+    expect(h.sends[0]?.content).toContain('id collision')
+  })

@@ -105,6 +105,11 @@ declare module '@deepseek-ai/dsh-client-ui-settings/client' {
   export type ClientContext = import('@deepseek-ai/dsh-client-runtime/client').ClientContext
 }
 
+declare module '@deepseek-ai/dsh-client-ui-primitives' {
+  export interface IconProps { size?: number; className?: string }
+  export const IconChevronDownOutline14: (props: IconProps) => unknown
+}
+
 declare module 'react' {
   export interface CSSProperties { [key: string]: string | number | undefined }
   export function useState<T>(initial: T): [T, (value: T) => void]

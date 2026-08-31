@@ -166,7 +166,9 @@ export class WecomCardController {
   private async loadModels(): Promise<void> {
     try {
       const response = await this.api.llm.models({})
-      const groups = (response?.result as { groups?: { id: string; name: string; models: { id: string; name?: string }[] }[] } | undefined)?.groups ?? []
+      // RpcResult 封装:{ ok: true, value: { groups, failures } }
+      const result = response?.result as { ok?: boolean; value?: { groups?: { id: string; name: string; models: { id: string; name?: string }[] }[] } } | undefined
+      const groups = result?.ok ? result.value?.groups ?? [] : []
       this.providers = groups.map(g => ({
         id: g.id,
         name: g.name ?? g.id,

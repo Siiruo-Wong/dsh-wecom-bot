@@ -44,6 +44,10 @@ interface SessionState {
   events: SessionEventLike[]
   timer: ReturnType<typeof setTimeout> | null
   creating: Promise<AgentHandleLike> | null
+  /** agent 实际会话 id(冲突自愈后与状态键不同);未设置时用状态键 */
+  agentId?: string
+  /** 是否已做过持久化冲突重试(每状态最多一次,避免死循环) */
+  collisionRetried?: boolean
 }
 
 /** 构造一条用户消息(与 dsh-llm createUserMessage 的形状一致) */
@@ -201,7 +205,7 @@ export class AgentBridge {
       state.handle = null
     }
     if (state.creating) return state.creating
-    const creating = this.createAgentHandle(sessionId)
+    const creating = this.createAgentHandle(state.agentId ?? sessionId)
     state.creating = creating
     try {
       const handle = await creating
@@ -270,6 +274,23 @@ export class AgentBridge {
       return
     }
     const { text, reason, errorMessage } = lastAssistantText(state.events)
+    // 持久化冲突自愈:同 id 的磁盘会话日志与内存会话错位(常见于应用重启后),
+    // 会话初始化在 turn 期间才抛错,create 期抓不到 → 销毁句柄换新 sessionId 原样重试一次。
+    if (
+      reason === 'error' && errorMessage && !state.collisionRetried &&
+      /collision|persisted log|does not match this live session/i.test(errorMessage)
+    ) {
+      state.collisionRetried = true
+      state.agentId = sessionId + '#' + Date.now().toString(36)
+      const handle = state.handle
+      state.handle = null
+      if (handle) void handle.dispose().catch(() => {})
+      this.logger.warn(`[wecom-bot] 会话 ${sessionId} 持久化冲突,改用 ${state.agentId} 重试本轮`)
+      state.events = []
+      state.queue.unshift({ id: prompt.id, task: prompt.task, target: prompt.target })
+      void this.pump(sessionId)
+      return
+    }
     const note = reason === 'error'
       ? '\n\n(⚠️ 本次任务出现错误' + (errorMessage ? ': ' + errorMessage : '') + ')'
       : reason === 'max-tokens'

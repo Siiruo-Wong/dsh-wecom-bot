@@ -10,7 +10,7 @@ export type WecomLocaleKey =
   | 'workspace' | 'workspaceHint'
   | 'maxTokens' | 'maxTokensHint'
   | 'taskPrefix' | 'taskPrefixHint'
-  | 'overridden' | 'reset' | 'expand' | 'collapse'
+  | 'overridden' | 'reset'
   | 'save' | 'saving' | 'discard' | 'unsaved' | 'saveFailed' | 'invalidNumber'
   | 'emptyModelOption' | 'emptyProviderOption'
 
@@ -35,8 +35,6 @@ export const zh: Record<WecomLocaleKey, string> = {
   taskPrefixHint: '拼在每条消息前,可注入安全约束或身份设定。',
   overridden: '已覆盖',
   reset: '重置为默认',
-  expand: '展开设置',
-  collapse: '收起设置',
   save: '保存',
   saving: '保存中…',
   discard: '放弃修改',
@@ -68,8 +66,6 @@ export const en: Record<WecomLocaleKey, string> = {
   taskPrefixHint: 'Prepended to every message; inject security constraints or identity.',
   overridden: 'Overridden',
   reset: 'Reset to default',
-  expand: 'Show settings',
-  collapse: 'Hide settings',
   save: 'Save',
   saving: 'Saving…',
   discard: 'Discard',
