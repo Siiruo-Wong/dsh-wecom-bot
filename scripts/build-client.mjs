@@ -34,7 +34,7 @@ await build({
     ].join('\n'),
   },
   footer: {
-    js: '\n\t}\n});',
+    js: '\n\t\treturn module.exports;\n\t}\n});',
   },
 })
 console.log('lib/client.js built (' + ID + ')')
