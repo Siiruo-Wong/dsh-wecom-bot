@@ -42,6 +42,16 @@ describe('splitSessionToken', () => {
   it('旧格式 #s-<数字> 不再识别,按普通消息处理', () => {
     expect(splitSessionToken('#s-7 继续')).toEqual({ rest: '#s-7 继续' })
   })
+
+  it('群聊 @提及 前缀不影响识别(企微会把 @机器人 拼到开头)', () => {
+    expect(splitSessionToken('@亚肯承襄 #2 继续分析')).toEqual({ token: '2', rest: '继续分析' })
+    expect(splitSessionToken('@亚肯承襄，#2继续')).toEqual({ token: '2', rest: '继续' })
+    expect(splitSessionToken('@亚肯承襄 #2,你理解我让你干啥了吗')).toEqual({ token: '2', rest: '你理解我让你干啥了吗' })
+  })
+
+  it('只有 @提及 不带标识:不剥离,按普通消息处理', () => {
+    expect(splitSessionToken('@亚肯承襄 继续分析')).toEqual({ rest: '@亚肯承襄 继续分析' })
+  })
 })
 
 describe('createSessionCounter', () => {

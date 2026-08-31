@@ -16,13 +16,17 @@ import { join } from 'node:path'
 const SESSION_TOKEN_RE = /^\s*#(\d+)(?=\D|$)/
 
 /**
- * 从消息文本中剥离开头的会话标识。
- * @returns token 存在时为 `#` 后的数字串;rest 为去掉标识后的剩余文本。
+ * 从消息文本中剥离会话标识。
+ * 企微群聊里用户 @机器人 时,@提及会被拼到消息开头(如 `@机器人 #2 继续`),
+ * 因此先剥离开头的 @提及再识别标识。
+ * @returns token 存在时为 `#` 后的数字串;rest 为去掉标识(含@提及)后的剩余文本。
  */
 export function splitSessionToken(text: string): { token?: string; rest: string } {
-  const match = SESSION_TOKEN_RE.exec(text)
+  // 剥离开头 @提及 及其后分隔符(空格/逗号等)
+  const stripped = text.replace(/^@[^\s@，,。]+[\s，,。]*/, '')
+  const match = SESSION_TOKEN_RE.exec(stripped)
   if (!match) return { rest: text }
-  return { token: match[1]!, rest: text.slice(match[0].length).trimStart() }
+  return { token: match[1]!, rest: stripped.slice(match[0].length).replace(/^[\s，,。、]+/, '') }
 }
 
 /** dsh 主目录:`$DSH_HOME` 或 `~/.dsh` */
