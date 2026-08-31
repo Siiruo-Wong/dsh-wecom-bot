@@ -1,3 +1,14 @@
+## 0.3.1
+
+### 修复
+
+- **agent 无工具目录导致复杂问题答非所问**:此前插件用 `agents.create` 创建会话时未挂载 agent 预设,
+  agent 只有默认 persona、没有任何工具。模型面对需要查目录/跑命令的问题时,只能把工具调用
+  写成 `<tool_calls>` 文本,会话即告完成,机器人把这段文本原样回复给用户。
+  现与 web 会话一致:解析部署默认预设(code)并写入 `meta.agentPreset` + `setup: presets.mount`,
+  agent 获得完整工具目录(The available tools + run_code),系统提示词由 1771 字符增至 36k+。
+  进程内实测:挂载后 tools 参数含 run_code,与 web 会话行为一致。
+
 # 更新日志
 
 ## 0.3.0 (未发布)

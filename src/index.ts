@@ -33,6 +33,7 @@ export { truncateUtf8, lastAssistantText, buildUserMessage } from './agent-bridg
 type BridgeCtx = {
   agents: AgentsServiceLike
   on(event: string, handler: (...args: unknown[]) => void): () => void
+  get<T>(key: string): T | undefined
 }
 
 export class WecomBot extends Service {

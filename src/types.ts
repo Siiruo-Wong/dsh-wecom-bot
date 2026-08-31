@@ -36,10 +36,20 @@ export interface AgentHandleLike {
 export interface AgentsServiceLike {
   create(options: {
     sessionId: string
-    meta: { cwd: string }
+    meta: { cwd: string; agentPreset?: string }
     agentOptions?: { provider?: string; model?: string; maxTokens?: number }
+    /** 创建期挂载 agent 预设(system prompt/工具目录等),与 web 会话一致 */
+    setup?: (agentCtx: unknown) => Promise<void>
   }): Promise<AgentHandleLike>
   get(id: string): AgentLike | undefined
+}
+
+/** ctx.get('agentPresets') 服务的最小接口面(与 dsh-agent-presets 形状对齐) */
+export interface AgentPresetsServiceLike {
+  /** 解析预设;id 省略时用部署配置的默认预设。 */
+  resolve(id?: string): Promise<{ id: string }>
+  /** 把预设的 agent 平面组合挂载到该 agent 的作用域上下文。 */
+  mount(agentCtx: unknown, id: string): Promise<void>
 }
 
 /** session/event 事件的结构形状(只需 assistant/message 与 turn/end 的字段) */

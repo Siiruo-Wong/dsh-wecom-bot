@@ -11,6 +11,7 @@
 import { randomUUID } from 'node:crypto'
 import type {
   AgentHandleLike,
+  AgentPresetsServiceLike,
   AgentsServiceLike,
   LoggerLike,
   ReplyTarget,
@@ -120,11 +121,14 @@ export class AgentBridge {
   /** agent 实际会话 id -> 状态键(冲突重试后 agent id 可能与状态键不同) */
   private readonly agentToSession = new Map<string, string>()
   private readonly disposers: (() => void)[] = []
+  /** 解析过一次的 agent 预设(agentPreset id + 挂载 setup);无预设服务时为空对象 */
+  private preset: { agentPreset?: string; setup?: (agentCtx: unknown) => Promise<void> } | null = null
 
   constructor(
     private readonly ctx: {
       agents: AgentsServiceLike
       on(event: string, handler: (...args: unknown[]) => void): () => void
+      get<T>(key: string): T | undefined
     },
     private readonly cfg: AgentBridgeConfig,
     private readonly sender: ReplySender,
@@ -217,32 +221,63 @@ export class AgentBridge {
     }
   }
 
+  /**
+   * 解析一次 agent 预设(与 web 会话一致的 agent 平面:persona/工具目录/run_code 等)。
+   * 无 agentPresets 服务或解析失败时按无预设创建(退化到部署默认)。
+   */
+  private async resolvePreset(): Promise<{ agentPreset?: string; setup?: (agentCtx: unknown) => Promise<void> }> {
+    if (this.preset) return this.preset
+    const presets = this.ctx.get?.<AgentPresetsServiceLike>('agentPresets')
+    if (!presets || typeof presets.resolve !== 'function' || typeof presets.mount !== 'function') {
+      this.preset = {}
+      return this.preset
+    }
+    try {
+      const resolved = await presets.resolve(undefined)
+      this.preset = {
+        agentPreset: resolved.id,
+        setup: async (agentCtx: unknown) => { await presets.mount(agentCtx, resolved.id) },
+      }
+    } catch (error) {
+      this.logger.warn(`[wecom-bot] agent 预设解析失败,按无预设创建: ${errMessage(error).slice(0, 120)}`)
+      this.preset = {}
+    }
+    return this.preset
+  }
+
+  /** 组装一次 agents.create 的公共参数(预设 + provider/model/maxTokens)。 */
+  private async createOptions(sessionId: string): Promise<{
+    sessionId: string
+    meta: { cwd: string; agentPreset?: string }
+    agentOptions: { provider?: string; model?: string; maxTokens?: number }
+    setup?: (agentCtx: unknown) => Promise<void>
+  }> {
+    const preset = await this.resolvePreset()
+    return {
+      sessionId,
+      meta: {
+        cwd: this.cfg.workspace,
+        ...(preset.agentPreset ? { agentPreset: preset.agentPreset } : {}),
+      },
+      agentOptions: {
+        ...(this.cfg.provider ? { provider: this.cfg.provider } : {}),
+        ...(this.cfg.model ? { model: this.cfg.model } : {}),
+        ...(this.cfg.maxTokens ? { maxTokens: this.cfg.maxTokens } : {}),
+      },
+      ...(preset.setup ? { setup: preset.setup } : {}),
+    }
+  }
+
   /** 会话创建冲突(磁盘持久化会话与内存状态错位)时自动换新 sessionId 重试一次。 */
   private async createAgentHandle(sessionId: string): Promise<AgentHandleLike> {
     try {
-      return await this.ctx.agents.create({
-        sessionId,
-        meta: { cwd: this.cfg.workspace },
-        agentOptions: {
-          ...(this.cfg.provider ? { provider: this.cfg.provider } : {}),
-          ...(this.cfg.model ? { model: this.cfg.model } : {}),
-          ...(this.cfg.maxTokens ? { maxTokens: this.cfg.maxTokens } : {}),
-        },
-      })
+      return await this.ctx.agents.create(await this.createOptions(sessionId))
     } catch (error) {
       const message = String((error as { message?: unknown })?.message ?? error)
       if (/collision|persisted log|does not match this live session/i.test(message)) {
         const alt = sessionId + '#' + Date.now().toString(36)
         this.logger.warn(`[wecom-bot] 会话 ${sessionId} 创建冲突(${message.slice(0, 80)}),改用 ${alt} 重试`)
-        return this.ctx.agents.create({
-          sessionId: alt,
-          meta: { cwd: this.cfg.workspace },
-          agentOptions: {
-            ...(this.cfg.provider ? { provider: this.cfg.provider } : {}),
-            ...(this.cfg.model ? { model: this.cfg.model } : {}),
-            ...(this.cfg.maxTokens ? { maxTokens: this.cfg.maxTokens } : {}),
-          },
-        })
+        return this.ctx.agents.create(await this.createOptions(alt))
       }
       throw error
     }

@@ -7,10 +7,12 @@ interface Harness {
   bridge: AgentBridge
   emit(event: string, ...args: unknown[]): void
   follows: UserMessageLike[]
-  created: { sessionId: string; meta: unknown; agentOptions: unknown }[]
+  created: { sessionId: string; meta: unknown; agentOptions: unknown; setup?: unknown }[]
   sends: { target: ReplyTarget; content: string }[]
   disposed: boolean
   logger: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn>; debug: ReturnType<typeof vi.fn> }
+  agentPresets: { resolve: ReturnType<typeof vi.fn>; mount: ReturnType<typeof vi.fn> }
+  ctx: { get: ReturnType<typeof vi.fn> }
 }
 
 function makeConfig(overrides: Partial<AgentBridgeConfig> = {}): AgentBridgeConfig {
@@ -27,14 +29,14 @@ function makeConfig(overrides: Partial<AgentBridgeConfig> = {}): AgentBridgeConf
 function makeHarness(overrides: Partial<AgentBridgeConfig> = {}): Harness {
   const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
   const follows: UserMessageLike[] = []
-  const created: { sessionId: string; meta: unknown; agentOptions: unknown }[] = []
+  const created: { sessionId: string; meta: unknown; agentOptions: unknown; setup?: unknown }[] = []
   const sends: { target: ReplyTarget; content: string }[] = []
   let liveAgent: AgentHandleLike | null = null
   let disposed = false
 
   const agents: AgentsServiceLike = {
     async create(options) {
-      created.push({ sessionId: options.sessionId, meta: options.meta, agentOptions: options.agentOptions })
+      created.push({ sessionId: options.sessionId, meta: options.meta, agentOptions: options.agentOptions, setup: options.setup })
       const agent = {
         id: options.sessionId,
         session: { id: options.sessionId },
@@ -56,8 +58,13 @@ function makeHarness(overrides: Partial<AgentBridgeConfig> = {}): Harness {
     },
   }
 
+  const agentPresets = {
+    resolve: vi.fn(async () => ({ id: 'code' })),
+    mount: vi.fn(async () => {}),
+  }
   const ctx = {
     agents,
+    get: vi.fn((key: string) => key === 'agentPresets' ? agentPresets : undefined),
     on(event: string, handler: (...args: unknown[]) => void) {
       const list = listeners.get(event) ?? []
       list.push(handler)
@@ -93,6 +100,8 @@ function makeHarness(overrides: Partial<AgentBridgeConfig> = {}): Harness {
       return disposed
     },
     logger,
+    agentPresets,
+    ctx,
   }
 }
 
@@ -109,7 +118,7 @@ describe('AgentBridge', () => {
     await tick()
     expect(h.created).toHaveLength(1)
     expect(h.created[0]?.sessionId).toBe('wecom:user1')
-    expect(h.created[0]?.meta).toEqual({ cwd: '/tmp/ws' })
+    expect(h.created[0]?.meta).toEqual({ cwd: '/tmp/ws', agentPreset: 'code' })
     expect(h.follows[0]?.content[0]?.text).toBe('你好')
 
     h.emit('session/event', { id: 'wecom:user1' }, {
@@ -371,4 +380,46 @@ describe('lastAssistantText error surfacing', () => {
     expect(h.created).toHaveLength(2) // 没有第三次创建
     expect(h.sends).toHaveLength(1)
     expect(h.sends[0]?.content).toContain('id collision')
+  })
+
+  it('创建 agent 时挂载部署默认预设(code),setup 调用 presets.mount', async () => {
+    const h = makeHarness()
+    h.bridge.enqueue('user1', 'hello', { touser: 'u1' })
+    await tick()
+    expect(h.created).toHaveLength(1)
+    expect(h.agentPresets.resolve).toHaveBeenCalledWith(undefined)
+    const rec = h.created[0]!
+    expect((rec.meta as { agentPreset?: string }).agentPreset).toBe('code')
+    expect(typeof rec.setup).toBe('function')
+    // 执行 setup → mount 被调用
+    await (rec.setup as (ctx: unknown) => Promise<void>)({})
+    expect(h.agentPresets.mount).toHaveBeenCalledWith({}, 'code')
+  })
+
+  it('冲突自愈重试的 agent 同样挂载预设', async () => {
+    const h = makeHarness()
+    h.bridge.enqueue('user1', 'x', { touser: 'u1' })
+    await tick()
+    h.emit('session/event', { id: 'wecom:user1' }, {
+      type: 'turn/end',
+      data: { reason: { kind: 'error', error: { message: 'session "wecom:user1" already has a persisted log on disk that does not match this live session (id collision)' } } },
+    })
+    h.emit('agent/status', { agent: { session: { id: 'wecom:user1' } }, status: 'idle' })
+    await tick()
+    expect(h.created).toHaveLength(2)
+    for (const rec of h.created) {
+      expect((rec.meta as { agentPreset?: string }).agentPreset).toBe('code')
+      expect(typeof rec.setup).toBe('function')
+    }
+  })
+
+  it('无 agentPresets 服务时退化为无预设创建', async () => {
+    const h = makeHarness()
+    ;(h as unknown as { ctx: { get: ReturnType<typeof vi.fn> } }).ctx.get.mockImplementation(() => undefined)
+    h.bridge.enqueue('user1', 'x', { touser: 'u1' })
+    await tick()
+    expect(h.created).toHaveLength(1)
+    const rec = h.created[0]!
+    expect((rec.meta as { agentPreset?: string }).agentPreset).toBeUndefined()
+    expect(rec.setup).toBeUndefined()
   })
