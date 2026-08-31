@@ -37,4 +37,11 @@ await build({
     js: '\n\t\treturn module.exports;\n\t}\n});',
   },
 })
+
+// 防回归:factory 契约要求返回导出(ClientBundleRegistration.factory -> Record<string, unknown>);
+// 缺失时宿主材料化导出为 undefined,报 invalid plugin ... received undefined。
+const out = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+if (!out.includes('return module.exports;')) {
+  throw new Error('build-client: lib/client.js 缺少 "return module.exports"(factory 契约),构建中止')
+}
 console.log('lib/client.js built (' + ID + ')')
