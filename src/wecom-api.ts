@@ -8,8 +8,12 @@
  * - 绝不记录 token / secret 内容。
  */
 import type { ReplyTarget } from './types.js'
+import { fitUtf8 } from './agent-bridge.js'
 
 const QYAPI = 'https://qyapi.weixin.qq.com/cgi-bin'
+
+/** 企微"应用消息-文本消息"content 上限 2048B;留安全余量按 2000B 截断(超长附截断标记) */
+const TEXT_MAX_BYTES = 2000
 
 /** token 无效/过期错误码:需刷新后重试 */
 const TOKEN_INVALID_CODES = new Set([40001, 40014, 42001])
@@ -81,9 +85,11 @@ export class WecomApi {
   /** 发送文本应用消息;失败抛 WecomApiError */
   async sendText(target: ReplyTarget, content: string): Promise<void> {
     if (!target.chatid && !target.touser) throw new WecomApiError(-1, '缺少回复目标(chatid/touser)', false)
+    // 企微文本消息 content 有 2048B 上限:超长按协议上限截断并附可见标记
+    const limited = fitUtf8(content, TEXT_MAX_BYTES)
     const body = target.chatid
-      ? { chatid: target.chatid, msgtype: 'text', text: { content } }
-      : { touser: target.touser, msgtype: 'text', agentid: this.options.agentId, text: { content }, safe: 0 }
+      ? { chatid: target.chatid, msgtype: 'text', text: { content: limited } }
+      : { touser: target.touser, msgtype: 'text', agentid: this.options.agentId, text: { content: limited }, safe: 0 }
 
     const doSend = async (token: string): Promise<{ errcode?: number; errmsg?: string }> => {
       const response = await fetch(`${QYAPI}/message/send?access_token=${token}`, {

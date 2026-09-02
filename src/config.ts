@@ -61,7 +61,8 @@ export interface Config {
   workspace: string
   /** 拼在每条消息前的系统提示/人设(可注入安全约束) */
   taskPrefix: string
-  /** 单条回复最大字节数(UTF-8),超长按字符边界截断 */
+  /** 单条回复最大字节数(UTF-8,长连接单条流式上限 20480B 内留安全余量);
+   *  超长按字符边界截断并附截断标记;回调模式固定按企微文本 2000B 截断,与此值无关 */
   replyLimitBytes: number
   /** 单条入站消息最大字符数 */
   inputLimitChars: number
@@ -138,7 +139,7 @@ export function resolveConfig(raw: Partial<Config> = {}): Config {
     maxTokens: num(raw.maxTokens, env.WECOM_BOT_MAX_TOKENS, 0) || undefined,
     workspace: resolve(str(raw.workspace, env.WECOM_BOT_WORKSPACE, process.cwd())),
     taskPrefix: str(raw.taskPrefix, env.WECOM_BOT_TASK_PREFIX, ''),
-    replyLimitBytes: num(raw.replyLimitBytes, env.WECOM_BOT_REPLY_LIMIT_BYTES, 2000),
+    replyLimitBytes: num(raw.replyLimitBytes, env.WECOM_BOT_REPLY_LIMIT_BYTES, 16_000),
     inputLimitChars: num(raw.inputLimitChars, env.WECOM_BOT_INPUT_LIMIT_CHARS, 4000),
     bodyLimitBytes: num(raw.bodyLimitBytes, env.WECOM_BOT_BODY_LIMIT_BYTES, 1_048_576),
     maxQueueDepth: num(raw.maxQueueDepth, env.WECOM_BOT_MAX_QUEUE_DEPTH, 5),

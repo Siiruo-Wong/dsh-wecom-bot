@@ -119,7 +119,7 @@ dsh plugin --profile web add /path/to/dsh-wecom-bot
 | `maxTokens` | `WECOM_BOT_MAX_TOKENS` | 宿主默认 | 单次请求输出 token 上限 |
 | `workspace` | `WECOM_BOT_WORKSPACE` | `process.cwd()` | agent 工作目录（bash/文件系统工具活动根） |
 | `taskPrefix` | `WECOM_BOT_TASK_PREFIX` | 空 | 拼在每条消息前的人设/安全约束 |
-| `replyLimitBytes` | `WECOM_BOT_REPLY_LIMIT_BYTES` | `2000` | 单条回复最大字节（UTF-8 安全截断） |
+| `replyLimitBytes` | `WECOM_BOT_REPLY_LIMIT_BYTES` | `16000` | 长连接单条回复最大字节(流式单帧上限 20480 内);超长截断并附「已截断」标记。回调模式固定按企微文本 2000B 截断 |
 | `inputLimitChars` | `WECOM_BOT_INPUT_LIMIT_CHARS` | `4000` | 单条入站消息最大字符数 |
 | `bodyLimitBytes` | `WECOM_BOT_BODY_LIMIT_BYTES` | `1048576` | 回调请求体最大字节 |
 | `maxQueueDepth` | `WECOM_BOT_MAX_QUEUE_DEPTH` | `5` | 每会话排队上限，超出提示繁忙 |

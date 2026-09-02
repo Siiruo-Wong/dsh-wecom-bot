@@ -21,7 +21,6 @@ function makeConfig(overrides: Partial<AgentBridgeConfig> = {}): AgentBridgeConf
     maxQueueDepth: 2,
     promptTimeoutMs: 60_000,
     sessionIdPrefix: 'wecom',
-    replyLimitBytes: 2000,
     ...overrides,
   }
 }

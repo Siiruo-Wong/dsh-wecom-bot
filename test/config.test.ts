@@ -33,7 +33,7 @@ describe('resolveConfig', () => {
     expect(cfg.maxAuthFailureAttempts).toBe(5)
     expect(cfg.requestTimeoutMs).toBe(10_000)
     expect(cfg.thinkingHint.length).toBeGreaterThan(0)
-    expect(cfg.replyLimitBytes).toBe(2000)
+    expect(cfg.replyLimitBytes).toBe(16_000)
     expect(cfg.maxQueueDepth).toBe(5)
     expect(cfg.workspace).toBe(process.cwd())
   })

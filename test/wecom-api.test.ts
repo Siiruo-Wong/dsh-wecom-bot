@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WecomApi, WecomApiError } from '../src/wecom-api.js'
+import { TRUNCATION_MARKER } from '../src/agent-bridge.js'
 
 const OPTIONS = { corpId: 'ww1', appSecret: 'sec', agentId: 1000002, timeoutMs: 1000 }
 
@@ -64,6 +65,22 @@ describe('WecomApi', () => {
     const body = JSON.parse(send.body ?? '{}')
     expect(body.chatid).toBe('wr_chat')
     expect(body.agentid).toBeUndefined()
+  })
+
+  it('sendText 超长文本:按企微文本上限(2000B)截断并附「已截断」标记', async () => {
+    const calls: { body?: string }[] = []
+    stubFetch(async (url, init) => {
+      calls.push({ body: init?.body as string })
+      return jsonResponse(url.includes('/gettoken')
+        ? { errcode: 0, access_token: 'tok', expires_in: 7200 }
+        : { errcode: 0 })
+    })
+    const api = new WecomApi(OPTIONS)
+    await api.sendText({ touser: 'u1' }, '长'.repeat(3000)) // 3000 字 ≈ 9000B,远超 2000B 上限
+    const body = JSON.parse(calls[1]!.body ?? '{}')
+    const content = body.text.content as string
+    expect(Buffer.byteLength(content, 'utf8')).toBeLessThanOrEqual(2000)
+    expect(content.endsWith(TRUNCATION_MARKER)).toBe(true)
   })
 
   it('token 失效:自动刷新并重试一次后成功', async () => {

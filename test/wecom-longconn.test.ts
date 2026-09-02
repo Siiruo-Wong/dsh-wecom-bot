@@ -1,15 +1,22 @@
 import { describe, expect, it, vi } from 'vitest'
 import { resolveConfig } from '../src/config.js'
-import { WecomLongConn } from '../src/wecom-longconn.js'
+import { WecomLongConn, type WecomLongConnOptions } from '../src/wecom-longconn.js'
+import { TRUNCATION_MARKER } from '../src/agent-bridge.js'
 import type { AgentBridge } from '../src/agent-bridge.js'
 import type { LongConnClientLike, ReplyTarget } from '../src/types.js'
 
-/** 桩 WS 客户端:记录连接状态与 replyStream 调用,可手动触发事件 */
+/** 桩 WS 客户端:记录连接状态与 replyStream 调用,可手动触发事件/注入失败 */
 class FakeClient {
   replies: Array<{ reqId: string; streamId: string; content: string; finish: boolean }> = []
+  /** 依次注入到 replyStream 的失败(每次调用消耗一个);空则成功 */
+  failures: unknown[] = []
   connected = false
   disconnected = false
   private handlers = new Map<string, Array<(...args: unknown[]) => void>>()
+
+  get isConnected(): boolean {
+    return this.connected
+  }
 
   on(event: string, handler: (...args: unknown[]) => void): this {
     const list = this.handlers.get(event) ?? []
@@ -37,6 +44,10 @@ class FakeClient {
   }
 
   replyStream(frame: { headers: { req_id: string } }, streamId: string, content: string, finish = false): Promise<unknown> {
+    if (this.failures.length > 0) {
+      const failure = this.failures.shift()!
+      return Promise.reject(failure)
+    }
     this.replies.push({ reqId: frame.headers.req_id, streamId, content, finish })
     return Promise.resolve()
   }
@@ -50,14 +61,14 @@ function makeBridge() {
   return { enqueue: vi.fn() } as unknown as AgentBridge
 }
 
-function makeHarness(overrides: Record<string, unknown> = {}) {
+function makeHarness(overrides: Record<string, unknown> = {}, options: WecomLongConnOptions = {}) {
   const client = new FakeClient()
   const bridge = makeBridge()
   const logger = makeLogger()
   const cfg = resolveConfig({ botId: 'bot-1', botSecret: 'sec-1', ...overrides } as never)
   let seq = 0
   const nextSession = vi.fn(() => String(++seq))
-  const adapter = new WecomLongConn(cfg, { bridge, logger, nextSession }, client as unknown as LongConnClientLike)
+  const adapter = new WecomLongConn(cfg, { bridge, logger, nextSession }, client as unknown as LongConnClientLike, options)
   return { client, bridge, logger, cfg, adapter, nextSession }
 }
 
@@ -65,6 +76,8 @@ const textFrame = (reqId: string, body: Record<string, unknown>) => ({
   headers: { req_id: reqId },
   body,
 })
+
+const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
 
 describe('WecomLongConn', () => {
   it('start() 建立连接,收到文本消息交给 bridge 并先发思考占位', () => {
@@ -154,6 +167,84 @@ describe('WecomLongConn', () => {
     const h = makeHarness()
     await h.adapter.sendText({ touser: 'u1' }, 'x')
     expect(h.client.replies).toHaveLength(0)
+  })
+
+  it('超长最终回复:按上限截断并附「已截断」标记(不再静默丢尾)', async () => {
+    const h = makeHarness({ replyLimitBytes: 128 })
+    h.adapter.start()
+    h.client.emit('message.text', textFrame('req-cap', { from: { userid: 'u1' }, text: { content: '问题' } }))
+    const target = (h.bridge.enqueue.mock.calls[0] as [string, string, ReplyTarget])[2]
+    await h.adapter.sendText(target, '长'.repeat(300)) // 300 字 ≈ 900B,远超 128B
+
+    const final = h.client.replies.at(-1)!
+    expect(final.finish).toBe(true)
+    expect(final.content.endsWith(TRUNCATION_MARKER)).toBe(true)
+    expect(Buffer.byteLength(final.content, 'utf8')).toBeLessThanOrEqual(128)
+  })
+
+  it('断线时最终回复暂存待发,重连(connected)后自动补发', async () => {
+    const h = makeHarness()
+    h.adapter.start()
+    h.client.connected = false // 模拟断线(如心跳超时/网络波动)
+    h.client.emit('message.text', textFrame('req-offline', { from: { userid: 'u1' }, text: { content: 'x' } }))
+    const target = (h.bridge.enqueue.mock.calls[0] as [string, string, ReplyTarget])[2]
+
+    await h.adapter.sendText(target, '断线期间的最终答复')
+    // 断线时不得直接尝试发送
+    expect(h.client.replies.filter((r) => r.finish === true)).toHaveLength(0)
+
+    h.client.connected = true
+    h.client.emit('connected') // 触发补发
+    await tick()
+    const finals = h.client.replies.filter((r) => r.finish === true)
+    expect(finals).toHaveLength(1)
+    expect(finals[0]!.reqId).toBe('req-offline')
+    expect(finals[0]!.content).toContain('断线期间的最终答复')
+  })
+
+  it('占位流超龄后:最终答复改用独立新消息发送,不依赖旧流', async () => {
+    // refreshMaxAgeMs=-1 → 任意非负流龄都算超龄,必走独立新消息
+    const h = makeHarness({}, { refreshMaxAgeMs: -1 })
+    h.adapter.start()
+    h.client.emit('message.text', textFrame('req-old', { from: { userid: 'u1' }, text: { content: 'x' } }))
+    const target = (h.bridge.enqueue.mock.calls[0] as [string, string, ReplyTarget])[2]
+    expect(h.client.replies).toHaveLength(1) // 占位已发
+
+    await h.adapter.sendText(target, '超龄任务的新消息答复')
+    const finals = h.client.replies.filter((r) => r.finish === true)
+    expect(finals).toHaveLength(1)
+    expect(finals[0]!.streamId).not.toBe(target.streamId) // 不是原位刷新
+    expect(finals[0]!.content).toContain('超龄任务的新消息答复')
+  })
+
+  it('服务端拒绝占位流(errcode≠0)后:切换独立新消息补发成功', async () => {
+    const h = makeHarness()
+    h.adapter.start()
+    h.client.emit('message.text', textFrame('req-srv', { from: { userid: 'u1' }, text: { content: 'x' } }))
+    const target = (h.bridge.enqueue.mock.calls[0] as [string, string, ReplyTarget])[2]
+
+    // 最终答复第一次(原位刷新旧流)被服务端以 errcode 拒绝 → 兜底走新消息
+    h.client.failures = [{ errcode: 50000, errmsg: 'stream expired' }]
+    await h.adapter.sendText(target, '被拒后的兜底答复')
+
+    const finals = h.client.replies.filter((r) => r.finish === true)
+    expect(finals).toHaveLength(1)
+    expect(finals[0]!.streamId).not.toBe(target.streamId)
+    expect(finals[0]!.content).toContain('被拒后的兜底答复')
+    expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining('被服务端拒绝'))
+  })
+
+  it('传输失败重试耗尽后明确记错放弃,不静默丢', async () => {
+    const h = makeHarness({}, { retryDelaysMs: [1, 1] }) // 最多 3 次尝试
+    h.adapter.start()
+    const err = new Error('WebSocket not connected, unable to send data')
+    h.client.failures = [err, err, err]
+
+    await h.adapter.sendText({ reqId: 'req-x', streamId: 'sx' }, '始终发不出去')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    expect(h.logger.error).toHaveBeenCalledWith(expect.stringContaining('已放弃'))
+    expect(h.client.replies.filter((r) => r.finish === true)).toHaveLength(0)
   })
 
   it('非文本消息:ignoreNonText=false 时回复提示', () => {

@@ -30,7 +30,6 @@ export interface AgentBridgeConfig {
   maxQueueDepth: number
   promptTimeoutMs: number
   sessionIdPrefix: string
-  replyLimitBytes: number
 }
 
 interface QueuedPrompt {
@@ -121,6 +120,25 @@ export function truncateUtf8(text: string, maxBytes: number): string {
     out += char
   }
   return out
+}
+
+/** 截断时附加的可见标记:让用户知道内容被切掉了(完整版在 dsh 会话记录里) */
+export const TRUNCATION_MARKER = '\n\n…（内容过长已截断，完整版见 dsh 会话记录）'
+
+/**
+ * 把文本适配到单条消息的字节上限:
+ * - 放得下时不截断;
+ * - 放不下时按字符边界截断,并附 TRUNCATION_MARKER 提示(预留标记字节);
+ * - 上限小到连标记都放不下时退化为静默截断(不再加标记,避免只回一个标记)。
+ * 截断由各发送通道按自己的协议上限调用(callback 2000B / longconn 16000B)。
+ */
+export function fitUtf8(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return ''
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text
+  const markerBytes = Buffer.byteLength(TRUNCATION_MARKER, 'utf8')
+  const budget = maxBytes - markerBytes
+  if (budget < 32) return truncateUtf8(text, maxBytes)
+  return truncateUtf8(text, budget) + TRUNCATION_MARKER
 }
 
 function errMessage(error: unknown): string {
@@ -431,8 +449,13 @@ export class AgentBridge {
     void this.pump(sessionId)
   }
 
+  /**
+   * 发出回复。不做内容截断:各通道(长连接 / 回调 API)按自己的单条消息协议上限
+   * (fitUtf8 + 截断标记)在发送端处理,避免"桥层按一个统一上限切完、通道层
+   * 拿不到超长内容再加标记"的两段式静默丢失。
+   */
   private reply(target: ReplyTarget, content: string): Promise<void> {
-    return this.sender.sendText(target, truncateUtf8(content, this.cfg.replyLimitBytes))
+    return this.sender.sendText(target, content)
       .catch((error: unknown) => {
         this.logger.error('[wecom-bot] 回复发送失败', error)
       })

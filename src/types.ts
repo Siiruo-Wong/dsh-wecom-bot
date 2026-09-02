@@ -107,6 +107,8 @@ export interface LongConnClientLike {
   connect(): unknown
   disconnect(): void
   removeListener?(event: string, handler: (...args: any[]) => void): void
+  /** 当前 WebSocket 是否处于可发送状态(断开/重连期间为 false) */
+  readonly isConnected: boolean
   replyStream(
     frame: { headers: { req_id: string } },
     streamId: string,

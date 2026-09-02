@@ -29,7 +29,7 @@ import type { AgentsServiceLike, ParsedCallback, ReplySender, ReplyTarget, Setti
 export type { Config } from './config.js'
 export { ConfigError } from './config.js'
 export { WecomApiError } from './wecom-api.js'
-export { truncateUtf8, lastAssistantText, buildUserMessage } from './agent-bridge.js'
+export { truncateUtf8, fitUtf8, TRUNCATION_MARKER, lastAssistantText, buildUserMessage } from './agent-bridge.js'
 
 type BridgeCtx = {
   agents: AgentsServiceLike
@@ -65,7 +65,7 @@ export class WecomBot extends Service {
     maxTokens: z.natural(),
     workspace: z.string().default(process.cwd()),
     taskPrefix: z.string().default(''),
-    replyLimitBytes: z.natural().default(2000),
+    replyLimitBytes: z.natural().default(16_000),
     inputLimitChars: z.natural().default(4000),
     bodyLimitBytes: z.natural().default(1_048_576),
     maxQueueDepth: z.natural().default(5),
