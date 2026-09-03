@@ -30,6 +30,10 @@ export interface AgentBridgeConfig {
   maxQueueDepth: number
   promptTimeoutMs: number
   sessionIdPrefix: string
+  /** 长连接心跳续话:处理满该时长(默认 7 分钟)仍未结束时发第一条"仍在处理" */
+  heartbeatStartMs?: number
+  /** 之后每隔该时长(默认 2.5 分钟)再发一条,维持企微回复窗口不被判定超时 */
+  heartbeatIntervalMs?: number
 }
 
 interface QueuedPrompt {
@@ -45,6 +49,7 @@ interface SessionState {
   current: QueuedPrompt | null
   events: SessionEventLike[]
   timer: ReturnType<typeof setTimeout> | null
+  heartbeat: ReturnType<typeof setTimeout> | null
   creating: Promise<AgentHandleLike> | null
   /** agent 实际会话 id(冲突自愈后与状态键不同);未设置时用状态键 */
   agentId?: string
@@ -60,6 +65,16 @@ interface SessionState {
  * 命中后按既有自愈路径换新 sessionId 原样重试一次。
  */
 const SESSION_COLLISION_RE = /collision|already exists|persisted log|refusing to materialize|does not match this live session/i
+
+/**
+ * 企微智能机器人长连接对单条入站消息的回复存在服务端时效(实测 546s 能回、
+ * 832s 被拒,疑为 10 分钟)。处理满 HEARTBEAT_START_MS 仍无任何回复时,自动发
+ * "仍在处理"心跳:若窗口随回复活动顺延则维持窗口直到完成;若窗口固定,心跳至少
+ * 让用户知道任务还在跑,满 10 分钟后的心跳附带"回复 #N 继续"的拉取指引。
+ */
+const HEARTBEAT_START_MS = 7 * 60_000
+const HEARTBEAT_INTERVAL_MS = 150_000
+const HEARTBEAT_WINDOW_HINT_MS = 10 * 60_000
 
 /** 构造一条用户消息(与 dsh-llm createUserMessage 的形状一致) */
 export function buildUserMessage(task: string): UserMessageLike {
@@ -194,7 +209,9 @@ export class AgentBridge {
     const sessionId = this.sessionIdOf(sessionKey)
     let state = this.sessions.get(sessionId)
     if (!state) {
-      state = { handle: null, queue: [], busy: false, current: null, events: [], timer: null, creating: null }
+      state = {
+        handle: null, queue: [], busy: false, current: null, events: [], timer: null, heartbeat: null, creating: null,
+      }
       this.sessions.set(sessionId, state)
     }
     if (state.queue.length >= this.cfg.maxQueueDepth) {
@@ -220,6 +237,7 @@ export class AgentBridge {
         void this.onTimeout(sessionId, state, next)
       }, this.cfg.promptTimeoutMs)
       state.timer.unref?.()
+      this.startHeartbeat(sessionId, state)
     } catch (error) {
       this.logger.warn(`[wecom-bot] 会话 ${sessionId} 派发失败`, error)
       state.busy = false
@@ -401,6 +419,7 @@ export class AgentBridge {
       clearTimeout(state.timer)
       state.timer = null
     }
+    this.clearHeartbeat(state)
     if (!prompt) {
       void this.pump(sessionId)
       return
@@ -441,6 +460,7 @@ export class AgentBridge {
     if (state.current === prompt) state.current = null
     state.busy = false
     state.timer = null
+    this.clearHeartbeat(state)
     // 超时通常是 agent 卡住:销毁句柄,下一条消息会重建全新会话
     const handle = state.handle
     state.handle = null
@@ -469,7 +489,51 @@ export class AgentBridge {
     this.sessions.clear()
     for (const state of states) {
       if (state.timer) clearTimeout(state.timer)
+      if (state.heartbeat) clearTimeout(state.heartbeat)
       if (state.handle) await state.handle.dispose().catch(() => {})
     }
+  }
+
+  private clearHeartbeat(state: SessionState): void {
+    if (state.heartbeat) {
+      clearTimeout(state.heartbeat)
+      state.heartbeat = null
+    }
+  }
+
+  /**
+   * 长连接"心跳续话":处理满 heartbeatStartMs 且目标带 reqId(企微长连接入站)时,
+   * 自动周期性发送"仍在处理"消息。目的:
+   * - 若企微回复窗口随活动顺延 → 心跳维持窗口,长任务最终答复可正常送达,无需用户干预;
+   * - 若窗口固定约 10 分钟 → 满 10 分钟后的心跳附带"回复 #<标识> 继续"指引,
+   *   用户回一句即开新窗口,可把已完成结论拉出来。
+   * 仅对带 reqId 的目标生效(callback 推送无时效限制,不打扰)。发送失败静默降级。
+   */
+  private startHeartbeat(sessionId: string, state: SessionState): void {
+    const prompt = state.current
+    const startMs = this.cfg.heartbeatStartMs ?? HEARTBEAT_START_MS
+    const intervalMs = this.cfg.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS
+    if (!prompt || !prompt.target.reqId || !(startMs > 0)) return
+    this.clearHeartbeat(state)
+    const target = prompt.target
+    const startedAt = Date.now()
+    const token = this.sessionToken(sessionId)
+    const tick = () => {
+      if (!state.busy || state.current !== prompt) {
+        state.heartbeat = null
+        return
+      }
+      const minutes = Math.max(1, Math.round((Date.now() - startedAt) / 60_000))
+      const overdue = Date.now() - startedAt >= HEARTBEAT_WINDOW_HINT_MS
+      const content = overdue
+        ? `⏳ 仍在处理中（已 ${minutes} 分钟）。企微单条消息回复有时限，若迟迟未收到结论，可回复 #${token} 继续。`
+        : `⏳ 仍在处理中（已 ${minutes} 分钟），完成后我会把完整结论发你。`
+      this.logger.debug(`[wecom-bot] 心跳续话(req=${target.reqId}, 已 ${minutes} 分钟)`)
+      void this.reply(target, content)
+      state.heartbeat = setTimeout(tick, intervalMs)
+      state.heartbeat.unref?.()
+    }
+    state.heartbeat = setTimeout(tick, startMs)
+    state.heartbeat.unref?.()
   }
 }

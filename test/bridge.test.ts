@@ -212,6 +212,41 @@ describe('AgentBridge', () => {
     expect(h.created).toHaveLength(2)
   })
 
+  it('长连接忙碌超过阈值:自动发"仍在处理"心跳,完成后心跳停止', async () => {
+    const h = makeHarness({ heartbeatStartMs: 20, heartbeatIntervalMs: 30 })
+    h.bridge.enqueue('u9', '长任务', { reqId: 'r1', streamId: 's1' })
+    await tick()
+    expect(h.follows).toHaveLength(1)
+    // 等待多条心跳(20/50/80/110ms …)
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    const hearts = h.sends.filter((s) => s.content.includes('仍在处理'))
+    expect(hearts.length).toBeGreaterThanOrEqual(2)
+    expect(hearts[0]!.content).toContain('完成后我会把完整结论发你')
+    expect(h.sends.some((s) => s.content.includes('会话标识'))).toBe(false) // 尚未结题
+
+    // agent 完成 → 只回一条最终答复,心跳不再发
+    h.emit('session/event', { id: 'wecom:u9' }, {
+      type: 'assistant/message',
+      data: { message: { content: [{ type: 'text', text: '最终结论' }] } },
+    })
+    h.emit('agent/status', { agent: { session: { id: 'wecom:u9' } }, status: 'idle' })
+    await tick()
+    expect(h.sends.filter((s) => s.content.includes('最终结论')).length).toBe(1)
+    const heartCount = h.sends.filter((s) => s.content.includes('仍在处理')).length
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    expect(h.sends.filter((s) => s.content.includes('仍在处理')).length).toBe(heartCount)
+    await h.bridge.dispose()
+  })
+
+  it('心跳只对带 reqId 的目标发送(回调推送不打扰)', async () => {
+    const h = makeHarness({ heartbeatStartMs: 10, heartbeatIntervalMs: 20 })
+    h.bridge.enqueue('uA', '回调任务', { touser: 'u1' })
+    await tick()
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    expect(h.sends.filter((s) => s.content.includes('仍在处理'))).toHaveLength(0)
+    await h.bridge.dispose()
+  })
+
   it('创建失败:回复错误信息并释放队列', async () => {
     const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
     const sends: { target: ReplyTarget; content: string }[] = []
