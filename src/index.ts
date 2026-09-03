@@ -13,18 +13,19 @@
  * 安全:凭据不入日志、长度限制、队列深度限制、默认仅绑定 127.0.0.1。
  * 详见 README.md 与 SECURITY.md。
  */
-import { resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { ConfigError, resolveConfig, type Config } from './config.js'
 import { createSessionCounter, dshHome, splitSessionToken } from './session-key.js'
+import { createTeeLogger } from './log-file.js'
 import { WECOM_SETTINGS_NAMESPACE, WecomSettingsSchema, type WecomSettings } from './settings.js'
 import { decryptWecomMessage, verifySignature } from './crypto.js'
 import { WecomApi } from './wecom-api.js'
 import { CallbackServer } from './http-server.js'
 import { AgentBridge } from './agent-bridge.js'
 import { WecomLongConn } from './wecom-longconn.js'
-import type { AgentsServiceLike, ParsedCallback, ReplySender, ReplyTarget, SettingsServiceLike, SettingsScopeLike } from './types.js'
+import type { AgentsServiceLike, LoggerLike, ParsedCallback, ReplySender, ReplyTarget, SettingsServiceLike, SettingsScopeLike } from './types.js'
 
 export type { Config } from './config.js'
 export { ConfigError } from './config.js'
@@ -77,6 +78,8 @@ export class WecomBot extends Service {
   })
 
   private cfg: Config
+  /** 落盘 tee 日志:转发宿主的同时写入 $DSH_HOME/logs/wecom-bot.log */
+  private readonly pluginLogger: LoggerLike
   private readonly bridge: AgentBridge
   private readonly wecom?: WecomApi
   private longconn?: WecomLongConn
@@ -89,9 +92,10 @@ export class WecomBot extends Service {
     super(ctx, 'wecomBot')
     const cfg = resolveConfig(raw)
     this.cfg = cfg
+    this.pluginLogger = createTeeLogger(ctx.logger, join(dshHome(), 'logs', 'wecom-bot.log'))
     // 递增会话号分配器(持久化于 $DSH_HOME/wecom-bot/session-seq,重启不归零)
     this.nextSession = createSessionCounter(dshHome(), (error) =>
-      ctx.logger.warn('[wecom-bot] 会话计数持久化失败', error),
+      this.pluginLogger.warn('[wecom-bot] 会话计数持久化失败', error),
     )
     const agents = (ctx as unknown as { agents?: AgentsServiceLike }).agents
     if (!agents) {
@@ -113,11 +117,11 @@ export class WecomBot extends Service {
           await this.wecom.sendText(target, content)
           return
         }
-        ctx.logger.warn('[wecom-bot] 无可用回复通道,已丢弃回复', target)
+        this.pluginLogger.warn('[wecom-bot] 无可用回复通道,已丢弃回复', target)
       },
     }
 
-    this.bridge = new AgentBridge(bridgeCtx, cfg, sender, ctx.logger)
+    this.bridge = new AgentBridge(bridgeCtx, cfg, sender, this.pluginLogger)
 
     if (needCallback) {
       this.wecom = new WecomApi({
@@ -131,7 +135,7 @@ export class WecomBot extends Service {
         {
           decrypt: (encrypt, params) => this.decryptPayload(encrypt, params),
           handleMessage: (message) => this.onMessage(message),
-          logger: ctx.logger,
+          logger: this.pluginLogger,
         },
       )
     }
@@ -139,7 +143,7 @@ export class WecomBot extends Service {
     if (needLongConn) {
       this.longconn = new WecomLongConn(cfg, {
         bridge: this.bridge,
-        logger: ctx.logger,
+        logger: this.pluginLogger,
         nextSession: this.nextSession,
       })
     }
@@ -154,13 +158,13 @@ export class WecomBot extends Service {
   async [Service.init](): Promise<void> {
     if (this.server && this.wecom) {
       const port = await this.server.start()
-      this.ctx.logger.info('[wecom-bot] 企微回调已监听 http://' + this.cfg.host + ':' + port + this.cfg.path)
+      this.pluginLogger.info('[wecom-bot] 企微回调已监听 http://' + this.cfg.host + ':' + port + this.cfg.path)
       if (this.cfg.checkOnStart) {
         try {
           await this.wecom.check()
-          this.ctx.logger.info('[wecom-bot] 企微连通性自检通过(access_token 获取成功)')
+          this.pluginLogger.info('[wecom-bot] 企微连通性自检通过(access_token 获取成功)')
         } catch (error) {
-          this.ctx.logger.error(
+          this.pluginLogger.error(
             '[wecom-bot] 企微连通性自检失败,请检查 corpid/appSecret',
             error instanceof Error ? error.message : error,
           )
@@ -169,7 +173,7 @@ export class WecomBot extends Service {
     }
     if (this.longconn) {
       this.longconn.start()
-      this.ctx.logger.info('[wecom-bot] 长连接模式已启动(botId=' + this.cfg.botId + ')')
+      this.pluginLogger.info('[wecom-bot] 长连接模式已启动(botId=' + this.cfg.botId + ')')
     }
     this.ctx.effect(() => async () => {
       if (this.server) await this.server.stop()

@@ -275,8 +275,10 @@ export class WecomLongConn {
       attempts: 0,
       asFreshMessage: !freshEntry,
     }
+    const ageSec = entry ? Math.round((Date.now() - entry.createdAt) / 1000) : undefined
     this.logger.debug(
-      `[wecom-bot] 最终回复发送(req=${reqId}, stream=${item.streamId}, 方式=${freshEntry ? '原位刷新占位流' : '独立新消息'})`,
+      `[wecom-bot] 最终回复发送(req=${reqId}, stream=${item.streamId}, 方式=${freshEntry ? '原位刷新占位流' : '独立新消息'}` +
+        (ageSec !== undefined ? `, 距入站 ${ageSec}s` : '') + ')',
     )
     await this.sendWithRetry(item)
   }
