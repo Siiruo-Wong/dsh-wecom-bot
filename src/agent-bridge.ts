@@ -62,6 +62,8 @@ interface SessionState {
   timedOut?: boolean
   /** 超时中止后等待 agent 收敛的兜底定时器 */
   settleTimer?: ReturnType<typeof setTimeout> | null
+  /** 已确认该 sessionId 没有持久化日志(resume 探测失败过一次),后续直连 create */
+  resumeMissed?: boolean
 }
 
 /**
@@ -89,6 +91,10 @@ const HEARTBEAT_WINDOW_HINT_MS = 10 * 60_000
  * 下一条消息仍复用同一个 agent,历史不丢。
  */
 const TIMEOUT_SETTLE_MS = 60_000
+
+/** resume 撞上"会话仍 live"时的重试次数与间隔(旧句柄刚 dispose / 宿主 GUI 正开着) */
+const RESUME_ATTEMPTS = 3
+const RESUME_LIVE_RETRY_MS = 150
 
 /** 构造一条用户消息(与 dsh-llm createUserMessage 的形状一致) */
 export function buildUserMessage(task: string): UserMessageLike {
@@ -283,7 +289,7 @@ export class AgentBridge {
       return shared
     }
     if (state.creating) return state.creating
-    const creating = this.createAgentHandle(state.agentId ?? sessionId)
+    const creating = this.attachAgentHandle(sessionId, state)
     state.creating = creating
     try {
       const handle = await creating
@@ -293,6 +299,26 @@ export class AgentBridge {
     } finally {
       state.creating = null
     }
+  }
+
+  /**
+   * 取到一个可用的 agent 句柄:已有持久化日志的会话**一律 resume**,纯新会话才 create。
+   *
+   * 为什么不能"create 一次不行再 resume":同一个 sessionId 走 create 会新建 live 会话 +
+   * 新 seed,持久化层校验「seed 能否复现已写前缀」必然失败并抛
+   * `does not match this live session (id collision)`——这个错在 turn 期才抛,
+   * 等于让用户白等一轮(2026-10-22 企微 #77 事故)。resume-first 从源头避开。
+   * 每个状态只试一次 resume:纯新会话第一次失败后记 `resumeMissed`,后续直连 create。
+   */
+  private async attachAgentHandle(sessionId: string, state: SessionState): Promise<AgentHandleLike> {
+    if (!state.resumeMissed) {
+      if (await this.recoverByResume(sessionId, state)) {
+        this.logger.info(`[wecom-bot] 会话 ${sessionId} 已从持久化日志 resume 续接`)
+        return state.handle as AgentHandleLike
+      }
+      state.resumeMissed = true
+    }
+    return this.createAgentHandle(state.agentId ?? sessionId)
   }
 
   /**
@@ -392,27 +418,53 @@ export class AgentBridge {
   }
 
   /**
-   * 用 `agents.resume` 续接磁盘上的既有会话。
+   * 用 `agents.resume` 续接磁盘上的既有会话,成功时把句柄挂回状态。
    *
    * 同一个 sessionId 复用只有一条合法路径:resume。create 走的是"新建 live 会话 +
    * 新 seed",持久化层会校验 seed 能否复现已写前缀——历史会话当然复现不了,
    * 于是抛 `does not match this live session (id collision)`,重试多少次都一样。
-   * @returns 成功时把句柄挂回状态并返回 true;resume 不可用/失败返回 false
+   * @returns 成功=true;resume 不可用/日志不存在/失败=false
    */
   private async recoverByResume(sessionId: string, state: SessionState): Promise<boolean> {
+    const resumed = await this.tryResume(sessionId)
+    if (resumed === null) return false
+    state.handle = resumed
+    state.agentId = resumed.agent.id
+    this.agentToSession.set(resumed.agent.id, sessionId)
+    this.setSessionTitle(resumed, sessionId)
+    return true
+  }
+
+  /**
+   * 尝试 resume 一个 sessionId(不改状态,调用方决定挂不挂)。
+   *
+   * 两处细节:
+   * - `cannot prepare session ... while it is live`:旧句柄刚 dispose、或宿主 GUI 正开着
+   *   该会话。前者稍等就好,后者直接把那个活跃 agent 借来用(共享句柄,不销毁宿主的)。
+   * - 其余失败(该 id 根本没有持久化日志)静默返回 null,调用方回落 create。
+   */
+  private async tryResume(sessionId: string): Promise<AgentHandleLike | null> {
     const agents = this.ctx.agents
-    if (typeof agents.resume !== 'function') return false
-    try {
-      const resumed = await agents.resume(await this.resumeOptions(sessionId))
-      state.handle = resumed
-      state.agentId = resumed.agent.id
-      this.agentToSession.set(resumed.agent.id, sessionId)
-      this.setSessionTitle(resumed, sessionId)
-      return true
-    } catch (error) {
-      this.logger.warn(`[wecom-bot] 会话 ${sessionId} resume 续接失败: ${errMessage(error).slice(0, 120)}`)
-      return false
+    if (typeof agents.resume !== 'function') return null
+    for (let attempt = 0; attempt < RESUME_ATTEMPTS; attempt++) {
+      try {
+        return await agents.resume(await this.resumeOptions(sessionId))
+      } catch (error) {
+        const message = errMessage(error)
+        if (/while it is live/i.test(message) && attempt < RESUME_ATTEMPTS - 1) {
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, RESUME_LIVE_RETRY_MS).unref?.()
+          })
+          const live = agents.get(sessionId)
+          // 宿主里已有活跃 agent(GUI 正开着该会话):共享句柄,绝不 dispose
+          if (live !== undefined) return { agent: live, dispose: async () => {} }
+          continue
+        }
+        this.logger.debug(`[wecom-bot] 会话 ${sessionId} resume 不可用: ${message.slice(0, 120)}`)
+        return null
+      }
     }
+    return null
   }
 
   /**
@@ -482,9 +534,12 @@ export class AgentBridge {
       state.agentId = undefined
       const handle = state.handle
       state.handle = null
-      if (handle) void handle.dispose().catch(() => {})
+      // 必须等句柄真的退休:resume 的 prepare 会拒一个仍 live 的会话
+      // (cannot prepare session ... while it is live),不 await 就等于必然失败。
+      if (handle) await handle.dispose().catch(() => {})
       state.events = []
       state.queue.unshift({ id: prompt.id, task: prompt.task, target: prompt.target })
+      state.resumeMissed = false
       const resumed = await this.recoverByResume(sessionId, state)
       this.logger.warn(
         `[wecom-bot] 会话 ${sessionId} 持久化冲突(${errorMessage.slice(0, 80)}),` +

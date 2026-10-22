@@ -630,7 +630,7 @@ describe('lastAssistantText error surfacing', () => {
     expect(h.sends[0]?.content).toContain('id collision')
   })
 
-  it('turn 期持久化冲突:宿主支持 resume 时优先续接原会话,不再 create 撞墙', async () => {
+  it('已有持久化日志的会话:首次消息直接 resume 续接,不 create、不撞冲突', async () => {
     const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
     const created: { sessionId: string }[] = []
     const resumed: { resumeSessionId: string }[] = []
@@ -678,25 +678,14 @@ describe('lastAssistantText error surfacing', () => {
       for (const handler of listeners.get(event) ?? []) handler(...args)
     }
 
+    // resume-first:有持久化日志的会话首轮就续接,create 一次都不该发生
     bridge.enqueue('user1', '续接我', { touser: 'u1' })
     await tick()
-    expect(created).toHaveLength(1)
-
-    // turn 期才抛的持久化冲突(懒初始化 flush 时)
-    emit('session/event', { id: 'wecom:user1' }, {
-      type: 'turn/end',
-      data: { reason: { kind: 'error', error: { message: 'session "wecom:user1" already has a persisted log on disk that does not match this live session (id collision)' } } },
-    })
-    emit('agent/status', { agent: { session: { id: 'wecom:user1' } }, status: 'idle' })
-    await tick()
-
-    // 关键:自愈走 resume,而不是再 create 一次(再 create 只会重复同样的冲突)
     expect(resumed).toHaveLength(1)
     expect(resumed[0]?.resumeSessionId).toBe('wecom:user1')
-    expect(created).toHaveLength(1)
-    expect(follows).toHaveLength(2)
-    expect(follows[1]?.content[0]?.text).toBe('续接我')
-    expect(sends).toHaveLength(0)
+    expect(created).toHaveLength(0)
+    expect(follows).toHaveLength(1)
+    expect(follows[0]?.content[0]?.text).toBe('续接我')
 
     // 续接后的会话正常收敛 → 正常回复
     emit('session/event', { id: 'wecom:user1' }, {
@@ -707,6 +696,145 @@ describe('lastAssistantText error surfacing', () => {
     await tick()
     expect(sends).toHaveLength(1)
     expect(bodyOf(sends[0]!.content)).toBe('续接后正常工作')
+    await bridge.dispose()
+  })
+
+  it('纯新会话:resume 探测失败一次后不再重复探测,直接 create', async () => {
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
+    const resumeCalls: string[] = []
+    const created: { sessionId: string }[] = []
+    const follows: UserMessageLike[] = []
+    let liveAgent: AgentHandleLike | null = null
+
+    const agents: AgentsServiceLike = {
+      async create(options) {
+        created.push({ sessionId: options.sessionId })
+        const agent = { id: options.sessionId, session: { id: options.sessionId }, followup(m: UserMessageLike) { follows.push(m) } }
+        liveAgent = { agent, dispose: async () => { liveAgent = null } }
+        return liveAgent
+      },
+      async resume(options) {
+        resumeCalls.push(options.resumeSessionId)
+        throw new Error(`session "${options.resumeSessionId}" has no persisted log on disk`)
+      },
+      get(id) {
+        return liveAgent && liveAgent.agent.id === id ? liveAgent.agent : undefined
+      },
+    }
+    const ctx = {
+      agents,
+      get: vi.fn(() => undefined),
+      on(event: string, handler: (...args: unknown[]) => void) {
+        const list = listeners.get(event) ?? []
+        list.push(handler)
+        listeners.set(event, list)
+        return () => {}
+      },
+    }
+    const wecom = { sendText: vi.fn(async () => {}) } as unknown as ReplySender
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }
+    const bridge = new AgentBridge(ctx as never, makeConfig({}), wecom, logger)
+    const emit = (event: string, ...args: unknown[]) => {
+      for (const handler of listeners.get(event) ?? []) handler(...args)
+    }
+
+    bridge.enqueue('user1', '第一句', { touser: 'u1' })
+    await tick()
+    expect(resumeCalls).toHaveLength(1) // 探测一次
+    expect(created).toHaveLength(1) // 回落 create
+
+    emit('agent/status', { agent: { session: { id: 'wecom:user1' } }, status: 'idle' })
+    await tick()
+    // 同一状态第二轮:不再重复探测 resume,复用句柄
+    bridge.enqueue('user1', '第二句', { touser: 'u1' })
+    await tick()
+    expect(resumeCalls).toHaveLength(1)
+    expect(created).toHaveLength(1)
+    expect(follows).toHaveLength(2)
+    await bridge.dispose()
+  })
+
+  it('turn 期持久化冲突:先等句柄退休再 resume(不 await dispose 会撞 "while it is live")', async () => {
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
+    const resumedWhenDisposed: boolean[] = []
+    const created: { sessionId: string }[] = []
+    const follows: UserMessageLike[] = []
+    const sends: { target: ReplyTarget; content: string }[] = []
+    let liveAgent: AgentHandleLike | null = null
+    let disposed = false
+
+    const agents: AgentsServiceLike = {
+      async create(options) {
+        created.push({ sessionId: options.sessionId })
+        const agent = { id: options.sessionId, session: { id: options.sessionId }, followup(m: UserMessageLike) { follows.push(m) } }
+        liveAgent = {
+          agent,
+          dispose: async () => {
+            // 模拟宿主 retire 有一个 tick 的异步延迟
+            await new Promise<void>((resolve) => setTimeout(resolve, 5))
+            disposed = true
+            liveAgent = null
+          },
+        }
+        return liveAgent
+      },
+      async resume(options) {
+        // 只有句柄真的退休了,宿主才允许 prepare
+        if (!disposed) throw new Error(`cannot prepare session "${options.resumeSessionId}" while it is live`)
+        resumedWhenDisposed.push(true)
+        const agent = { id: options.resumeSessionId, session: { id: options.resumeSessionId }, followup(m: UserMessageLike) { follows.push(m) } }
+        liveAgent = { agent, dispose: async () => { liveAgent = null } }
+        return liveAgent
+      },
+      get(id) {
+        return liveAgent && liveAgent.agent.id === id ? liveAgent.agent : undefined
+      },
+    }
+    const ctx = {
+      agents,
+      get: vi.fn(() => undefined),
+      on(event: string, handler: (...args: unknown[]) => void) {
+        const list = listeners.get(event) ?? []
+        list.push(handler)
+        listeners.set(event, list)
+        return () => {}
+      },
+    }
+    const wecom = { sendText: vi.fn(async (target: ReplyTarget, content: string) => { sends.push({ target, content }) }) } as unknown as ReplySender
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }
+    const bridge = new AgentBridge(ctx as never, makeConfig({}), wecom, logger)
+    const emit = (event: string, ...args: unknown[]) => {
+      for (const handler of listeners.get(event) ?? []) handler(...args)
+    }
+
+    bridge.enqueue('user1', '重试我', { touser: 'u1' })
+    // 探测撞 "while it is live" 会重试 3 次(150ms 间隔)后才回落 create,给足时间
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    expect(created).toHaveLength(1)
+
+    // turn 期才抛的持久化冲突(懒初始化 flush 时)
+    emit('session/event', { id: 'wecom:user1' }, {
+      type: 'turn/end',
+      data: { reason: { kind: 'error', error: { message: 'session "wecom:user1" already has a persisted log on disk that does not match this live session (id collision)' } } },
+    })
+    emit('agent/status', { agent: { session: { id: 'wecom:user1' } }, status: 'idle' })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    // 关键:resume 是在句柄退休之后才成功的(否则必然 "while it is live")
+    expect(resumedWhenDisposed).toEqual([true])
+    expect(created).toHaveLength(1) // 自愈没有再 create
+    expect(follows).toHaveLength(2)
+    expect(follows[1]?.content[0]?.text).toBe('重试我')
+    expect(sends).toHaveLength(0)
+
+    emit('session/event', { id: 'wecom:user1' }, {
+      type: 'assistant/message',
+      data: { message: { content: [{ type: 'text', text: '退休后续接成功' }] } },
+    })
+    emit('agent/status', { agent: { session: { id: 'wecom:user1' } }, status: 'idle' })
+    await tick()
+    expect(sends).toHaveLength(1)
+    expect(bodyOf(sends[0]!.content)).toBe('退休后续接成功')
     await bridge.dispose()
   })
 
