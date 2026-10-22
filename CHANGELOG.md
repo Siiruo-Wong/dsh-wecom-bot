@@ -2,6 +2,16 @@
 
 ### 修复
 
+- **超时把会话做死**:此前单轮超时直接 `handle.dispose()`,后果有三:①宿主播
+  `host/session-removed`,该会话在 dsh Web 侧栏**当场消失**;②半小时的上下文随句柄一起没了;
+  ③下一条 `#N` 续接时磁盘日志还在,`agents.create` 撞上
+  `already has a persisted log on disk that does not match this live session (id collision)`,
+  重试几次都一样,会话彻底无法续接(企微 #77 事故)。现在超时只 `agent.cancel({kind:'user'})`
+  中止当轮,**句柄、会话与 JSONL 日志一律保留**,回复里给出 `#N` 续接指引;新增
+  `timeoutSettleMs`(默认 60s)兜底:agent 卡死不回 idle 时结束本轮等待,但依旧不销毁会话。
+- **turn 期持久化冲突自愈用错 API**:冲突错误是在 turn 期(持久化懒初始化 flush)才抛的,
+  `createAgentHandle` 的 catch 抓不到,自愈分支却仍用 `agents.create` 按原 id 重试——必然再撞同一堵墙。
+  现在自愈分支先走 `agents.resume` 续接磁盘日志(保留全部记忆),resume 不可用才回落原逻辑。
 - **回复被静默截断成前半段**:此前回复在桥层按 `replyLimitBytes`(默认 2000B)无条件按字节硬切,
   无任何提示——长报告常只到一半。现按通道各自协议上限处理:
   长连接(流式单帧上限 20480B)默认提到 **16000B**,回调模式固定按企微文本 **2000B** 截断;

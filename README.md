@@ -123,7 +123,8 @@ dsh plugin --profile web add /path/to/dsh-wecom-bot
 | `inputLimitChars` | `WECOM_BOT_INPUT_LIMIT_CHARS` | `4000` | 单条入站消息最大字符数 |
 | `bodyLimitBytes` | `WECOM_BOT_BODY_LIMIT_BYTES` | `1048576` | 回调请求体最大字节 |
 | `maxQueueDepth` | `WECOM_BOT_MAX_QUEUE_DEPTH` | `5` | 每会话排队上限，超出提示繁忙 |
-| `promptTimeoutMs` | `WECOM_BOT_PROMPT_TIMEOUT_MS` | `600000` | 单轮 agent 任务超时 |
+| `promptTimeoutMs` | `WECOM_BOT_PROMPT_TIMEOUT_MS` | `600000` | 单轮 agent 任务超时；超时**只中止当轮**（`agent.cancel`），不销毁会话、不删日志，上下文保留 |
+| `timeoutSettleMs` | `WECOM_BOT_TIMEOUT_SETTLE_MS` | `60000` | 超时中止后等待 agent 收敛的兜底窗口；仍未回 idle 就结束本轮等待（会话与句柄依旧保留） |
 | `sessionIdPrefix` | `WECOM_BOT_SESSION_ID_PREFIX` | `wecom` | 会话 ID 前缀，避免与 Web UI 会话冲突 |
 | `checkOnStart` | `WECOM_BOT_CHECK_ON_START` | `false` | 启动时做一次企微连通性自检 |
 | `ignoreNonText` | `WECOM_BOT_IGNORE_NON_TEXT` | `true` | 非文本消息是否静默忽略 |

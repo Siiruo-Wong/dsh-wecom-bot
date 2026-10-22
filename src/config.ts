@@ -70,8 +70,10 @@ export interface Config {
   bodyLimitBytes: number
   /** 每个会话允许排队等待的最大消息数,超出直接提示繁忙 */
   maxQueueDepth: number
-  /** 单轮 agent 任务超时(毫秒),超时回复并重置该会话 */
+  /** 单轮 agent 任务超时(毫秒):超时只中止当轮并保留会话,不销毁句柄、不删日志 */
   promptTimeoutMs: number
+  /** 超时中止后等待 agent 收敛(回 idle)的兜底窗口(毫秒),默认 60000 */
+  timeoutSettleMs: number
   /** 会话 ID 前缀,避免与 Web UI 等其它会话冲突 */
   sessionIdPrefix: string
   /** 启动时是否做一次企微连通性自检(callback 模式) */
@@ -144,6 +146,7 @@ export function resolveConfig(raw: Partial<Config> = {}): Config {
     bodyLimitBytes: num(raw.bodyLimitBytes, env.WECOM_BOT_BODY_LIMIT_BYTES, 1_048_576),
     maxQueueDepth: num(raw.maxQueueDepth, env.WECOM_BOT_MAX_QUEUE_DEPTH, 5),
     promptTimeoutMs: num(raw.promptTimeoutMs, env.WECOM_BOT_PROMPT_TIMEOUT_MS, 600_000),
+    timeoutSettleMs: num(raw.timeoutSettleMs, env.WECOM_BOT_TIMEOUT_SETTLE_MS, 60_000),
     sessionIdPrefix: str(raw.sessionIdPrefix, env.WECOM_BOT_SESSION_ID_PREFIX, 'wecom'),
     checkOnStart: bool(raw.checkOnStart, env.WECOM_BOT_CHECK_ON_START, false),
     ignoreNonText: bool(raw.ignoreNonText, env.WECOM_BOT_IGNORE_NON_TEXT, true),
@@ -167,6 +170,7 @@ export function resolveConfig(raw: Partial<Config> = {}): Config {
     bodyLimitBytes: cfg.bodyLimitBytes,
     maxQueueDepth: cfg.maxQueueDepth,
     promptTimeoutMs: cfg.promptTimeoutMs,
+    timeoutSettleMs: cfg.timeoutSettleMs,
     apiTimeoutMs: cfg.apiTimeoutMs,
   })) {
     if (!Number.isInteger(value) || value <= 0) throw new ConfigError(`${name} 必须是正整数: ${value}`)

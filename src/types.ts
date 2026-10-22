@@ -25,6 +25,12 @@ export interface AgentLike {
   id: string
   session: { id: string }
   followup(message: UserMessageLike): void
+  /**
+   * 中止当前轮但**不销毁会话**:超时保护用它掐掉卡住的一轮,上下文与
+   * 持久化日志原样保留,用户带 `#<标识>` 回来即可续接。
+   * 旧宿主可能没有该能力,调用方必须按可选处理(退化:只结束本桥的等待)。
+   */
+  cancel?(cause?: { kind: 'user' }): void
 }
 
 export interface AgentHandleLike {

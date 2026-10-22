@@ -71,6 +71,7 @@ export class WecomBot extends Service {
     bodyLimitBytes: z.natural().default(1_048_576),
     maxQueueDepth: z.natural().default(5),
     promptTimeoutMs: z.natural().default(600_000),
+    timeoutSettleMs: z.natural().default(60_000),
     sessionIdPrefix: z.string().default('wecom'),
     checkOnStart: z.boolean().default(false),
     ignoreNonText: z.boolean().default(true),

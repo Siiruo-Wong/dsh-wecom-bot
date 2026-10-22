@@ -9,6 +9,8 @@ interface Harness {
   follows: UserMessageLike[]
   created: { sessionId: string; meta: unknown; agentOptions: unknown; setup?: unknown }[]
   sends: { target: ReplyTarget; content: string }[]
+  /** 每次 agent.cancel 的中止原因(超时保护应只 cancel 不 dispose) */
+  cancels: string[]
   disposed: boolean
   logger: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn>; debug: ReturnType<typeof vi.fn> }
   agentPresets: { resolve: ReturnType<typeof vi.fn>; mount: ReturnType<typeof vi.fn> }
@@ -30,6 +32,7 @@ function makeHarness(overrides: Partial<AgentBridgeConfig> = {}, preseed?: Agent
   const follows: UserMessageLike[] = []
   const created: { sessionId: string; meta: unknown; agentOptions: unknown; setup?: unknown }[] = []
   const sends: { target: ReplyTarget; content: string }[] = []
+  const cancels: string[] = []
   let liveAgent: AgentHandleLike | null = preseed ?? null
   let disposed = false
 
@@ -41,6 +44,9 @@ function makeHarness(overrides: Partial<AgentBridgeConfig> = {}, preseed?: Agent
         session: { id: options.sessionId },
         followup(message: UserMessageLike) {
           follows.push(message)
+        },
+        cancel(cause?: { kind: 'user' }) {
+          cancels.push(cause?.kind ?? 'none')
         },
       }
       liveAgent = {
@@ -100,6 +106,7 @@ function makeHarness(overrides: Partial<AgentBridgeConfig> = {}, preseed?: Agent
     follows,
     created,
     sends,
+    cancels,
     get disposed() {
       return disposed
     },
@@ -196,20 +203,58 @@ describe('AgentBridge', () => {
     expect(h.sends[0]?.content).toContain('出现错误')
   })
 
-  it('超时:回复超时提示并销毁句柄,下一条消息重建', async () => {
-    const h = makeHarness({ promptTimeoutMs: 20 })
+  it('超时:只中止当轮(不销毁句柄),会话保留,下一条消息复用同一 agent', async () => {
+    const h = makeHarness({ promptTimeoutMs: 20, timeoutSettleMs: 20 })
     h.bridge.enqueue('user1', '慢任务', { touser: 'u1' })
     await tick()
-    await tick()
     expect(h.follows).toHaveLength(1)
-    await new Promise((resolve) => setTimeout(resolve, 80))
+    await new Promise((resolve) => setTimeout(resolve, 90))
+    // 中止当轮:调了 cancel,但**没有** dispose
+    expect(h.cancels).toEqual(['user'])
+    expect(h.disposed).toBe(false)
     expect(h.sends.some((s) => s.content.includes('超时'))).toBe(true)
-    expect(h.disposed).toBe(true)
-    // 下一条消息会重建会话
+    expect(h.sends.some((s) => s.content.includes('#user1'))).toBe(true) // 给出续接指引
+    // 下一条消息复用同一 agent(不重建会话,上下文不丢)
     h.bridge.enqueue('user1', '再来', { touser: 'u1' })
     await tick()
+    expect(h.created).toHaveLength(1)
+    expect(h.follows).toHaveLength(2)
+  })
+
+  it('超时中止后 agent 正常收敛:本轮回复带超时说明,会话仍保留', async () => {
+    const h = makeHarness({ promptTimeoutMs: 20, timeoutSettleMs: 5_000 })
+    h.bridge.enqueue('user1', '慢任务', { touser: 'u1' })
     await tick()
-    expect(h.created).toHaveLength(2)
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    expect(h.cancels).toEqual(['user'])
+    expect(h.sends).toHaveLength(0) // 还在等 agent 收敛,先不回话
+    // agent 收敛:本轮以 aborted 结束
+    h.emit('session/event', { id: 'wecom:user1' }, { type: 'turn/end', data: { reason: { kind: 'aborted' } } })
+    h.emit('agent/status', { agent: { session: { id: 'wecom:user1' } }, status: 'idle' })
+    await tick()
+    expect(h.sends).toHaveLength(1)
+    expect(h.sends[0]?.content).toContain('超时')
+    expect(h.sends[0]?.content).toContain('#user1')
+    expect(h.disposed).toBe(false)
+    // 上下文仍在:下一条消息复用同一 agent
+    h.bridge.enqueue('user1', '继续', { touser: 'u1' })
+    await tick()
+    expect(h.created).toHaveLength(1)
+    expect(h.follows).toHaveLength(2)
+  })
+
+  it('超时中止后 agent 迟迟不收敛:兜底结束本轮等待,仍不销毁会话', async () => {
+    const h = makeHarness({ promptTimeoutMs: 20, timeoutSettleMs: 30 })
+    h.bridge.enqueue('user1', '卡死的任务', { touser: 'u1' })
+    await tick()
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(h.cancels).toEqual(['user'])
+    expect(h.sends.some((s) => s.content.includes('超时'))).toBe(true)
+    expect(h.disposed).toBe(false)
+    h.bridge.enqueue('user1', '继续', { touser: 'u1' })
+    await tick()
+    expect(h.created).toHaveLength(1)
+    expect(h.follows).toHaveLength(2)
   })
 
   it('长连接忙碌超过阈值:自动发"仍在处理"心跳,完成后心跳停止', async () => {
@@ -583,6 +628,86 @@ describe('lastAssistantText error surfacing', () => {
     expect(h.created).toHaveLength(2) // 没有第三次创建
     expect(h.sends).toHaveLength(1)
     expect(h.sends[0]?.content).toContain('id collision')
+  })
+
+  it('turn 期持久化冲突:宿主支持 resume 时优先续接原会话,不再 create 撞墙', async () => {
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
+    const created: { sessionId: string }[] = []
+    const resumed: { resumeSessionId: string }[] = []
+    const follows: UserMessageLike[] = []
+    const sends: { target: ReplyTarget; content: string }[] = []
+    let liveAgent: AgentHandleLike | null = null
+
+    const agents: AgentsServiceLike = {
+      async create(options) {
+        created.push({ sessionId: options.sessionId })
+        const agent = { id: options.sessionId, session: { id: options.sessionId }, followup(m: UserMessageLike) { follows.push(m) } }
+        liveAgent = { agent, dispose: async () => { liveAgent = null } }
+        return liveAgent
+      },
+      async resume(options) {
+        resumed.push({ resumeSessionId: options.resumeSessionId })
+        const agent = { id: options.resumeSessionId, session: { id: options.resumeSessionId }, followup(m: UserMessageLike) { follows.push(m) } }
+        liveAgent = { agent, dispose: async () => { liveAgent = null } }
+        return liveAgent
+      },
+      get(id) {
+        return liveAgent && liveAgent.agent.id === id ? liveAgent.agent : undefined
+      },
+    }
+
+    const sessionTitle = { rename: vi.fn(() => ({ title: 'x', eventSeq: 0 })) }
+    const ctx = {
+      agents,
+      get: vi.fn((key: string) => key === 'sessionTitle' ? sessionTitle : undefined),
+      on(event: string, handler: (...args: unknown[]) => void) {
+        const list = listeners.get(event) ?? []
+        list.push(handler)
+        listeners.set(event, list)
+        return () => {
+          const arr = listeners.get(event) ?? []
+          const at = arr.indexOf(handler)
+          if (at >= 0) arr.splice(at, 1)
+        }
+      },
+    }
+    const wecom = { sendText: vi.fn(async (target: ReplyTarget, content: string) => { sends.push({ target, content }) }) } as unknown as ReplySender
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }
+    const bridge = new AgentBridge(ctx as never, makeConfig({}), wecom, logger)
+    const emit = (event: string, ...args: unknown[]) => {
+      for (const handler of listeners.get(event) ?? []) handler(...args)
+    }
+
+    bridge.enqueue('user1', '续接我', { touser: 'u1' })
+    await tick()
+    expect(created).toHaveLength(1)
+
+    // turn 期才抛的持久化冲突(懒初始化 flush 时)
+    emit('session/event', { id: 'wecom:user1' }, {
+      type: 'turn/end',
+      data: { reason: { kind: 'error', error: { message: 'session "wecom:user1" already has a persisted log on disk that does not match this live session (id collision)' } } },
+    })
+    emit('agent/status', { agent: { session: { id: 'wecom:user1' } }, status: 'idle' })
+    await tick()
+
+    // 关键:自愈走 resume,而不是再 create 一次(再 create 只会重复同样的冲突)
+    expect(resumed).toHaveLength(1)
+    expect(resumed[0]?.resumeSessionId).toBe('wecom:user1')
+    expect(created).toHaveLength(1)
+    expect(follows).toHaveLength(2)
+    expect(follows[1]?.content[0]?.text).toBe('续接我')
+    expect(sends).toHaveLength(0)
+
+    // 续接后的会话正常收敛 → 正常回复
+    emit('session/event', { id: 'wecom:user1' }, {
+      type: 'assistant/message',
+      data: { message: { content: [{ type: 'text', text: '续接后正常工作' }] } },
+    })
+    emit('agent/status', { agent: { session: { id: 'wecom:user1' } }, status: 'idle' })
+    await tick()
+    expect(sends).toHaveLength(1)
+    expect(bodyOf(sends[0]!.content)).toBe('续接后正常工作')
+    await bridge.dispose()
   })
 
   it('创建 agent 时挂载部署默认预设(code),setup 调用 presets.mount', async () => {

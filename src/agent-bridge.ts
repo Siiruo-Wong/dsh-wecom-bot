@@ -6,7 +6,8 @@
  * - 每个会话(用户/群/话题)一条 FIFO 队列 + 深度上限,超出直接提示繁忙;
  * - 同一会话复用同一 sessionId(agent),天然获得多轮上下文(JSONL 持久化由宿主提供);
  * - 通过 session/event 收集本轮事件,agent 空闲(idle)时取最后一条 assistant/message 作为答复;
- * - 单轮超时保护:超时回复并销毁该会话句柄,下一条消息自动重建全新会话;
+ * - 单轮超时保护:超时只**中止当轮**(agent.cancel),不 dispose、不删日志,
+ *   上下文保留,用户带 `#<标识>` 回来即可续接;
  * - agent 句柄与注册表不一致(如插件重载)时自愈重建。
  */
 import { randomUUID } from 'node:crypto'
@@ -30,6 +31,8 @@ export interface AgentBridgeConfig {
   maxQueueDepth: number
   promptTimeoutMs: number
   sessionIdPrefix: string
+  /** 超时中止后等待 agent 收敛(回 idle)的兜底窗口,默认 60s;超时也**不销毁会话**,只结束本桥的等待 */
+  timeoutSettleMs?: number
   /** 长连接心跳续话:处理满该时长(默认 7 分钟)仍未结束时发第一条"仍在处理" */
   heartbeatStartMs?: number
   /** 之后每隔该时长(默认 2.5 分钟)再发一条,维持企微回复窗口不被判定超时 */
@@ -55,6 +58,10 @@ interface SessionState {
   agentId?: string
   /** 是否已做过持久化冲突重试(每状态最多一次,避免死循环) */
   collisionRetried?: boolean
+  /** 本轮已被超时中止(仅影响回复措辞;会话与句柄一律保留) */
+  timedOut?: boolean
+  /** 超时中止后等待 agent 收敛的兜底定时器 */
+  settleTimer?: ReturnType<typeof setTimeout> | null
 }
 
 /**
@@ -75,6 +82,13 @@ const SESSION_COLLISION_RE = /collision|already exists|persisted log|refusing to
 const HEARTBEAT_START_MS = 7 * 60_000
 const HEARTBEAT_INTERVAL_MS = 150_000
 const HEARTBEAT_WINDOW_HINT_MS = 10 * 60_000
+
+/**
+ * 超时中止后的收敛窗口:agent.cancel 之后若迟迟没回到 idle(工具调用卡死、
+ * 下游请求不返回等),就结束本桥这一轮的等待。**句柄与会话一律保留**,
+ * 下一条消息仍复用同一个 agent,历史不丢。
+ */
+const TIMEOUT_SETTLE_MS = 60_000
 
 /** 构造一条用户消息(与 dsh-llm createUserMessage 的形状一致) */
 export function buildUserMessage(task: string): UserMessageLike {
@@ -378,6 +392,30 @@ export class AgentBridge {
   }
 
   /**
+   * 用 `agents.resume` 续接磁盘上的既有会话。
+   *
+   * 同一个 sessionId 复用只有一条合法路径:resume。create 走的是"新建 live 会话 +
+   * 新 seed",持久化层会校验 seed 能否复现已写前缀——历史会话当然复现不了,
+   * 于是抛 `does not match this live session (id collision)`,重试多少次都一样。
+   * @returns 成功时把句柄挂回状态并返回 true;resume 不可用/失败返回 false
+   */
+  private async recoverByResume(sessionId: string, state: SessionState): Promise<boolean> {
+    const agents = this.ctx.agents
+    if (typeof agents.resume !== 'function') return false
+    try {
+      const resumed = await agents.resume(await this.resumeOptions(sessionId))
+      state.handle = resumed
+      state.agentId = resumed.agent.id
+      this.agentToSession.set(resumed.agent.id, sessionId)
+      this.setSessionTitle(resumed, sessionId)
+      return true
+    } catch (error) {
+      this.logger.warn(`[wecom-bot] 会话 ${sessionId} resume 续接失败: ${errMessage(error).slice(0, 120)}`)
+      return false
+    }
+  }
+
+  /**
    * 给会话设置显式标题「企微 #<数字>」,与企微回复中回显的会话标识一致,
    * 便于在 dsh 记录中识别/复盘。session-title 服务随 dsh-base 挂载
    * (ctx.get('sessionTitle'));未挂载或失败时静默降级,不影响会话运行。
@@ -419,16 +457,23 @@ export class AgentBridge {
       clearTimeout(state.timer)
       state.timer = null
     }
+    if (state.settleTimer) {
+      clearTimeout(state.settleTimer)
+      state.settleTimer = null
+    }
     this.clearHeartbeat(state)
+    const timedOut = state.timedOut === true
+    state.timedOut = false
     if (!prompt) {
       void this.pump(sessionId)
       return
     }
     const { text, reason, errorMessage } = lastAssistantText(state.events)
-    // 持久化冲突自愈:同 id 的磁盘会话日志与内存会话错位(常见于应用重启后),
-    // 会话初始化在 turn 期间才抛错,create 期抓不到 → 销毁句柄,按原 sessionId
-    // 重走 create→resume 路径续接原会话;resume 失败时 createAgentHandle 会
-    // 兜底换新 sessionId,不会死循环。
+    // 持久化冲突自愈:同 id 的磁盘日志与内存会话错位(应用重启/插件重载后常见),
+    // 且这个错是在 turn 期(持久化懒初始化 flush 时)才抛,turn 期的 create 抓不到。
+    // 关键:这里**必须**走 agents.resume —— 同 id 再 create 只会继续撞
+    // "already has a persisted log ... does not match this live session (id collision)",
+    // 把会话彻底做死(2026-10-22 企微 #77 事故就是这么续不上的)。
     if (
       reason === 'error' && errorMessage && !state.collisionRetried &&
       SESSION_COLLISION_RE.test(errorMessage)
@@ -438,34 +483,88 @@ export class AgentBridge {
       const handle = state.handle
       state.handle = null
       if (handle) void handle.dispose().catch(() => {})
-      this.logger.warn(`[wecom-bot] 会话 ${sessionId} 持久化冲突,销毁句柄按原 id 重试本轮(resume 续接)`)
       state.events = []
       state.queue.unshift({ id: prompt.id, task: prompt.task, target: prompt.target })
+      const resumed = await this.recoverByResume(sessionId, state)
+      this.logger.warn(
+        `[wecom-bot] 会话 ${sessionId} 持久化冲突(${errorMessage.slice(0, 80)}),` +
+        (resumed ? '已 resume 续接原会话并重试本轮' : 'resume 不可用,按原 id 重试本轮'),
+      )
       void this.pump(sessionId)
       return
     }
-    const note = reason === 'error'
-      ? '\n\n(⚠️ 本次任务出现错误' + (errorMessage ? ': ' + errorMessage : '') + ')'
-      : reason === 'max-tokens'
-        ? '\n\n(⚠️ 已达输出上限,回复可能不完整)'
-        : ''
+    const note = timedOut
+      ? `\n\n(⏱️ 本轮超时已中止,会话与上下文都保留;回复 #${this.sessionToken(sessionId)} 继续即可)`
+      : reason === 'error'
+        ? '\n\n(⚠️ 本次任务出现错误' + (errorMessage ? ': ' + errorMessage : '') + ')'
+        : reason === 'max-tokens'
+          ? '\n\n(⚠️ 已达输出上限,回复可能不完整)'
+          : ''
     const body = text || '(模型没有返回文本)'
     const content = `📎 会话标识:#${this.sessionToken(sessionId)}\n\n${body}${note}`
     void this.reply(prompt.target, content)
     void this.pump(sessionId)
   }
 
+  /**
+   * 单轮超时:只中止这一轮,**不销毁会话、不删日志**。
+   *
+   * 历史教训:早先这里直接 `handle.dispose()`,会话被宿主处置 → Web 侧秒收
+   * `host/session-removed` 把列表行摘掉,用户连着聊了半小时的上下文也一起没了;
+   * 且下一次 `#N` 续接因为磁盘日志还在,create 会撞 "does not match this live
+   * session (id collision)",等于把会话做死。
+   *
+   * 现在的语义:
+   * 1. `agent.cancel({kind:'user'})` 掐掉卡住的一轮,agent 与 JSONL 日志原样留下;
+   * 2. 本轮正常收敛(agent 回 idle)时由 `finishTurn` 统一收尾,回复带超时说明;
+   * 3. 收敛不了(工具卡死)时由 `timeoutSettleMs` 兜底结束本桥的等待,**句柄不释放**,
+   *    下一条消息继续复用同一 agent,多轮上下文完整。
+   */
   private async onTimeout(sessionId: string, state: SessionState, prompt: QueuedPrompt): Promise<void> {
-    this.logger.warn(`[wecom-bot] 会话 ${sessionId} 任务超时(${this.cfg.promptTimeoutMs}ms)`)
-    if (state.current === prompt) state.current = null
-    state.busy = false
     state.timer = null
+    if (state.current !== prompt) {
+      // 超时回调晚到,本轮已被正常收尾:无事可做
+      void this.pump(sessionId)
+      return
+    }
+    this.logger.warn(`[wecom-bot] 会话 ${sessionId} 任务超时(${this.cfg.promptTimeoutMs}ms),中止当轮并保留会话`)
+    state.timedOut = true
+    const agent = state.handle?.agent
+    if (agent && typeof agent.cancel === 'function') {
+      try {
+        agent.cancel({ kind: 'user' })
+      } catch (error) {
+        this.logger.warn(`[wecom-bot] 会话 ${sessionId} 中止当轮失败: ${errMessage(error).slice(0, 120)}`)
+      }
+    } else {
+      // 宿主没有 cancel 能力:不强杀会话,只结束本桥等待,句柄留给下一条消息复用
+      this.logger.warn(`[wecom-bot] 会话 ${sessionId} 宿主不支持 cancel,仅结束本轮等待(会话保留)`)
+    }
+    const settleMs = this.cfg.timeoutSettleMs ?? TIMEOUT_SETTLE_MS
+    if (state.settleTimer) clearTimeout(state.settleTimer)
+    state.settleTimer = setTimeout(() => {
+      this.forceSettle(sessionId, state, prompt)
+    }, settleMs)
+    state.settleTimer.unref?.()
+  }
+
+  /**
+   * 超时中止后 agent 仍未收敛的兜底:结束本桥这一轮的等待并回话。
+   * **不 dispose 句柄、不碰持久化**:会话继续存在于宿主与磁盘,接着聊即可。
+   */
+  private forceSettle(sessionId: string, state: SessionState, prompt: QueuedPrompt): void {
+    state.settleTimer = null
+    if (state.current !== prompt) return
+    this.logger.warn(`[wecom-bot] 会话 ${sessionId} 中止后未收敛,结束本轮等待(会话与句柄保留)`)
+    state.current = null
+    state.busy = false
+    state.timedOut = false
     this.clearHeartbeat(state)
-    // 超时通常是 agent 卡住:销毁句柄,下一条消息会重建全新会话
-    const handle = state.handle
-    state.handle = null
-    if (handle) void handle.dispose().catch(() => {})
-    void this.reply(prompt.target, `📎 会话标识:#${this.sessionToken(sessionId)}\n\n⏱️ 处理超时,请稍后重试。`)
+    const token = this.sessionToken(sessionId)
+    void this.reply(
+      prompt.target,
+      `📎 会话标识:#${token}\n\n⏱️ 本轮超时已停止等待(会话与上下文都保留着)。直接回复 #${token} 继续接着聊即可。`,
+    )
     void this.pump(sessionId)
   }
 
@@ -481,7 +580,7 @@ export class AgentBridge {
       })
   }
 
-  /** 插件卸载时清理:取消监听、清定时器、处置所有会话句柄 */
+  /** 插件卸载时清理:取消监听、清定时器、处置本桥自己创建的会话句柄 */
   async dispose(): Promise<void> {
     for (const dispose of this.disposers.splice(0)) dispose()
     this.agentToSession.clear()
@@ -490,6 +589,7 @@ export class AgentBridge {
     for (const state of states) {
       if (state.timer) clearTimeout(state.timer)
       if (state.heartbeat) clearTimeout(state.heartbeat)
+      if (state.settleTimer) clearTimeout(state.settleTimer)
       if (state.handle) await state.handle.dispose().catch(() => {})
     }
   }
